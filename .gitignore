@@ -1,0 +1,6 @@
+dance-scheduler
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env

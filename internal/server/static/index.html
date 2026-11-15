@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Thursday Latin Dancing at Scrumpy's — Instructor Scheduler</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">💃</span>
+      <div>
+        <h1>Thursday Latin Dancing @ Scrumpy's</h1>
+        <p class="subtitle">Fairness-Based Instructor &amp; DJ Scheduler</p>
+      </div>
+    </div>
+    <div id="auth-bar" class="auth-bar"></div>
+  </header>
+
+  <nav class="tabs" id="nav-tabs">
+    <button class="tab active" data-tab="schedule">📅 Thursdays (6mo)</button>
+    <button class="tab" data-tab="fairness">⚖️ Fairness &amp; Tokens</button>
+    <button class="tab" data-tab="digests">📣 WhatsApp &amp; FB Copy</button>
+    <button class="tab hidden" id="admin-tab-btn" data-tab="admin">🛠️ Admin</button>
+  </nav>
+
+  <main class="container">
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- Login Banner when unauthenticated -->
+    <section id="login-card" class="card login-card hidden">
+      <h2>Instructor Sign-In (Phone OTP)</h2>
+      <p class="muted">Enter your phone number from the WhatsApp instructor group. We'll send a 6-digit login code.</p>
+      <div class="login-row" id="otp-step-phone">
+        <input type="tel" id="login-phone" placeholder="+1 (970) 555-0100" />
+        <button class="btn primary" id="btn-request-otp">Send 6-Digit Code</button>
+      </div>
+      <div class="login-row hidden" id="otp-step-code">
+        <input type="text" id="login-code" placeholder="6-digit code" maxlength="6" />
+        <button class="btn primary" id="btn-verify-otp">Verify &amp; Sign In</button>
+        <button class="btn ghost" id="btn-reset-otp">Back</button>
+      </div>
+      <p id="otp-hint" class="otp-hint hidden"></p>
+    </section>
+
+    <!-- TAB 1: Schedule -->
+    <section id="tab-schedule" class="tab-panel">
+      <div class="toolbar">
+        <div id="month-filters" class="month-filters"></div>
+        <div class="legend">
+          <span class="badge status-open">Open</span>
+          <span class="badge status-tentative">Bid Placed (Resolves T-7d)</span>
+          <span class="badge status-resolved">Confirmed</span>
+        </div>
+      </div>
+      <div id="events-grid" class="events-grid"></div>
+    </section>
+
+    <!-- TAB 2: Fairness & Tokens -->
+    <section id="tab-fairness" class="tab-panel hidden">
+      <div class="split-grid">
+        <div class="card">
+          <h2>Fairness Priority Standings</h2>
+          <p class="muted" id="fairness-explainer"></p>
+          <div id="fairness-list" class="roster-list"></div>
+        </div>
+        <div class="card">
+          <h2>⭐ Veto Token Reservations</h2>
+          <p class="muted">Each instructor gets <span id="tokens-per-year-label">2</span> Veto Tokens per calendar year to lock in a special Thursday or override fairness contention.</p>
+          <div id="token-history-list" class="token-history"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 3: WhatsApp Digest & FB Event Copy-Paste -->
+    <section id="tab-digests" class="tab-panel hidden">
+      <div class="split-grid">
+        <div class="card">
+          <div class="card-head">
+            <h2>WhatsApp 4-Week Digest</h2>
+            <button class="btn small" id="btn-copy-digest">Copy Digest</button>
+          </div>
+          <p class="muted">Low-noise summary for the WhatsApp group (resolutions + open dates + help requests).</p>
+          <pre id="digest-preview" class="code-box"></pre>
+        </div>
+        <div class="card">
+          <h2>Facebook Event Copy-Paste (Confirmed Nights)</h2>
+          <p class="muted">Pre-filled title, schedule, instructor, and DJ for ~30-second manual Facebook event creation.</p>
+          <div id="fb-events-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: Admin Panel -->
+    <section id="tab-admin" class="tab-panel hidden">
+      <div class="split-grid">
+        <div class="card">
+          <h2>Add / Update Instructor Roster</h2>
+          <form id="form-add-teacher" class="stack-form">
+            <div class="form-row">
+              <input type="text" id="adm-name" placeholder="Instructor Name" required />
+              <input type="tel" id="adm-phone" placeholder="Phone (+1970...)" required />
+            </div>
+            <div class="form-row">
+              <input type="text" id="adm-handle" placeholder="Telegram @handle (optional)" />
+              <label class="checkbox-label">
+                <input type="checkbox" id="adm-is-admin" /> Admin
+              </label>
+              <button type="submit" class="btn primary">Save Instructor</button>
+            </div>
+          </form>
+          <h3>Active Roster</h3>
+          <div id="admin-roster-list" class="roster-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Scheduler Parameters &amp; Resolver</h2>
+            <button class="btn primary small" id="btn-run-resolver">Run Resolver &amp; Recruitment Sweep Now</button>
+          </div>
+          <form id="form-config" class="stack-form">
+            <div class="config-grid" id="admin-config-fields"></div>
+            <button type="submit" class="btn">Save Config Parameters</button>
+          </form>
+          <h3>Transport Outbox (<span id="transport-mode-label">manual</span>)</h3>
+          <div id="admin-outbox-list" class="outbox-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
