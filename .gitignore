@@ -4,3 +4,5 @@ dance-scheduler
 *.db-wal
 *.log
 .env
+bot/node_modules/
+bot/auth_info/
