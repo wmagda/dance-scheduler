@@ -47,6 +47,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/bids/withdraw", s.handleWithdrawBid)
 	s.mux.HandleFunc("POST /api/events/details", s.handleUpdateEventDetails)
 	s.mux.HandleFunc("POST /api/events/volunteer", s.handleVolunteer)
+	s.mux.HandleFunc("POST /api/events/unvolunteer", s.handleUnvolunteer)
 
 	s.mux.HandleFunc("POST /api/bot/inbound", s.handleBotInbound)
 
@@ -293,6 +294,28 @@ func (s *Server) handleVolunteer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.VolunteerForEvent(r.Context(), viewer, req.EventID, req.Role); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleUnvolunteer(w http.ResponseWriter, r *http.Request) {
+	viewer := s.currentTeacher(r)
+	if viewer == nil {
+		writeErr(w, http.StatusUnauthorized, "please log in first")
+		return
+	}
+	var req struct {
+		EventID   int64  `json:"event_id"`
+		TeacherID int64  `json:"teacher_id"`
+		Role      string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if err := s.store.UnvolunteerForEvent(r.Context(), viewer, req.EventID, req.TeacherID, req.Role); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

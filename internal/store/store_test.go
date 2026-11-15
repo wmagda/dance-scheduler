@@ -104,16 +104,22 @@ func TestFairnessTokensPrivacyAndRecruitment(t *testing.T) {
 		t.Fatalf("expected 1/2 tokens left for Carlos, got %d/%d (err=%v)", availAfter1, totalTokens, err)
 	}
 
-	// 4. Help flag surfaces requester name + allows volunteering
+	// 4. Help flag surfaces requester name + allows volunteering (but NOT self-volunteering, and NOT editing by others)
 	if err := st.PlaceBid(ctx, newbie.ID, ev4.ID, "normal", baseNow); err != nil {
 		t.Fatalf("Sofia bid ev4: %v", err)
+	}
+	if err := st.UpdateEventDetails(ctx, reg, ev4.ID, "salsa", "Hijacked", "DJ Bad", "", false, false, false); err == nil {
+		t.Fatalf("expected non-owner Carlos to be rejected from editing Sofia's event")
 	}
 	if err := st.UpdateEventDetails(ctx, newbie, ev4.ID, "bachata", "Sensual footwork", "DJ Papi", "Bring water", true, false, false); err != nil {
 		t.Fatalf("UpdateEventDetails: %v", err)
 	}
+	if err := st.VolunteerForEvent(ctx, newbie, ev4.ID, "lead"); err == nil {
+		t.Fatalf("expected Sofia to be blocked from volunteering on her own lesson")
+	}
 	ev4ForCarlos, _ := st.GetEventView(ctx, ev4.ID, reg.ID, false)
-	if !ev4ForCarlos.NeedLead || ev4ForCarlos.HelpRequester != "Sofia New" {
-		t.Fatalf("expected help flag to expose Sofia New as HelpRequester, got %+v", ev4ForCarlos)
+	if !ev4ForCarlos.NeedLead || ev4ForCarlos.HelpRequester != "Sofia New" || !ev4ForCarlos.CanVolunteer {
+		t.Fatalf("expected help flag to expose Sofia New as HelpRequester and allow Carlos to volunteer, got %+v", ev4ForCarlos)
 	}
 	if err := st.VolunteerForEvent(ctx, admin, ev4.ID, "lead"); err != nil {
 		t.Fatalf("VolunteerForEvent: %v", err)
@@ -121,6 +127,13 @@ func TestFairnessTokensPrivacyAndRecruitment(t *testing.T) {
 	ev4AfterVol, _ := st.GetEventView(ctx, ev4.ID, reg.ID, false)
 	if ev4AfterVol.NeedLead || len(ev4AfterVol.Volunteers) != 1 {
 		t.Fatalf("expected NeedLead cleared and 1 volunteer recorded, got %+v", ev4AfterVol)
+	}
+	if err := st.UnvolunteerForEvent(ctx, admin, ev4.ID, admin.ID, "lead"); err != nil {
+		t.Fatalf("UnvolunteerForEvent: %v", err)
+	}
+	ev4AfterUnvol, _ := st.GetEventView(ctx, ev4.ID, reg.ID, false)
+	if !ev4AfterUnvol.NeedLead || len(ev4AfterUnvol.Volunteers) != 0 {
+		t.Fatalf("expected NeedLead re-opened and 0 volunteers after unvolunteer, got %+v", ev4AfterUnvol)
 	}
 
 	// 5. OTP login flow

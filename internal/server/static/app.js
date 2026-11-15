@@ -130,7 +130,15 @@ function renderEvents() {
         : "";
 
       const vols = (ev.volunteers || [])
-        .map((v) => `<span class="pill">${escapeHtml(v.name)} (${escapeHtml(v.role)})</span>`)
+        .map((v) => {
+          const canRemove =
+            STATE.viewer &&
+            (v.teacher_id === STATE.viewer.id || ev.can_edit_details || STATE.viewer.is_admin);
+          const rmBtn = canRemove
+            ? ` <button class="pill-remove" title="Remove from role" onclick="unvolunteer(${ev.id}, ${v.teacher_id}, '${escapeAttr(v.role)}')">✕</button>`
+            : "";
+          return `<span class="pill">${escapeHtml(v.name)} (${escapeHtml(v.role)})${rmBtn}</span>`;
+        })
         .join(" ");
 
       let helpHtml = "";
@@ -144,13 +152,13 @@ function renderEvents() {
           <div class="help-box">
             🤝 <strong>${who}</strong> requested help: <strong>${needs.join(", ")}</strong>
             ${
-              STATE.viewer
+              ev.can_volunteer
                 ? `<div class="action-row">
                     ${ev.need_lead ? `<button class="btn small" onclick="volunteer(${ev.id}, 'lead')">I'll Lead</button>` : ""}
                     ${ev.need_follow ? `<button class="btn small" onclick="volunteer(${ev.id}, 'follow')">I'll Follow</button>` : ""}
                     ${ev.need_co ? `<button class="btn small" onclick="volunteer(${ev.id}, 'co')">I'll Co-Teach</button>` : ""}
                    </div>`
-                : ""
+                : `<div class="event-meta">Waiting for another instructor to volunteer.</div>`
             }
           </div>
         `;
@@ -200,36 +208,50 @@ function renderEvents() {
       const drawerHtml = drawerOpen
         ? `
         <div class="details-drawer">
-          <div class="form-row">
+          <div class="field-group">
+            <label>Dance Style for the Lesson</label>
             <select id="edit-type-${ev.id}">
               <option value="salsa" ${ev.lesson_type === "salsa" ? "selected" : ""}>Salsa</option>
               <option value="bachata" ${ev.lesson_type === "bachata" ? "selected" : ""}>Bachata</option>
               <option value="mixed" ${ev.lesson_type === "mixed" ? "selected" : ""}>Salsa &amp; Bachata</option>
+              <option value="cumbia" ${ev.lesson_type === "cumbia" ? "selected" : ""}>Cumbia</option>
               <option value="other" ${ev.lesson_type === "other" ? "selected" : ""}>Other</option>
             </select>
-            <input type="text" id="edit-detail-${ev.id}" value="${escapeAttr(ev.lesson_detail)}" placeholder="Topic (e.g. Rueda, Sensual)" />
           </div>
-          <div class="form-row">
-            <input type="text" id="edit-dj-${ev.id}" value="${escapeAttr(ev.dj)}" placeholder="DJ Name" />
-            <input type="text" id="edit-notes-${ev.id}" value="${escapeAttr(ev.notes)}" placeholder="Extra notes" />
+          <div class="field-group">
+            <label>Lesson Focus / Level (optional)</label>
+            <input type="text" id="edit-detail-${ev.id}" value="${escapeAttr(ev.lesson_detail)}" placeholder="e.g. Beginner Turn Patterns, Rueda, Sensual" />
           </div>
-          <div class="form-row">
-            <label><input type="checkbox" id="edit-lead-${ev.id}" ${ev.need_lead ? "checked" : ""}/> Need Lead</label>
-            <label><input type="checkbox" id="edit-follow-${ev.id}" ${ev.need_follow ? "checked" : ""}/> Need Follow</label>
-            <label><input type="checkbox" id="edit-co-${ev.id}" ${ev.need_co ? "checked" : ""}/> Need Co-Teacher</label>
+          <div class="field-group">
+            <label>Who is DJing? (leave blank if not decided yet)</label>
+            <input type="text" id="edit-dj-${ev.id}" value="${escapeAttr(ev.dj)}" placeholder="e.g. DJ Sebas" />
+          </div>
+          <div class="field-group">
+            <label>Extra Notes for the Night (optional)</label>
+            <input type="text" id="edit-notes-${ev.id}" value="${escapeAttr(ev.notes)}" placeholder="e.g. Birthday dance at 9:30pm" />
+          </div>
+          <div class="field-group">
+            <label>Ask Other Instructors for Help</label>
+            <div class="form-row">
+              <label><input type="checkbox" id="edit-lead-${ev.id}" ${ev.need_lead ? "checked" : ""}/> Need a Lead</label>
+              <label><input type="checkbox" id="edit-follow-${ev.id}" ${ev.need_follow ? "checked" : ""}/> Need a Follow</label>
+              <label><input type="checkbox" id="edit-co-${ev.id}" ${ev.need_co ? "checked" : ""}/> Need a Co-Instructor</label>
+            </div>
           </div>
           <div class="action-row">
-            <button class="btn primary small" onclick="saveEventDetails(${ev.id})">Save Details</button>
+            <button class="btn primary small" onclick="saveEventDetails(${ev.id})">Save Night Details</button>
           </div>
         </div>`
         : "";
+
+      const djDisplay = ev.dj ? escapeHtml(ev.dj) : "TBD";
 
       return `
         <div class="event-card">
           <div class="event-head">
             <div>
               <div class="event-date">${formatDateNice(ev.date)}</div>
-              <div class="event-meta">Lesson: <strong>${escapeHtml(ev.lesson_type.toUpperCase())}</strong>${ev.lesson_detail ? " (" + escapeHtml(ev.lesson_detail) + ")" : ""} · DJ: <strong>${escapeHtml(ev.dj)}</strong></div>
+              <div class="event-meta">Lesson: <strong>${escapeHtml(ev.lesson_type.toUpperCase())}</strong>${ev.lesson_detail ? " (" + escapeHtml(ev.lesson_detail) + ")" : ""} · DJ: <strong>${djDisplay}</strong></div>
             </div>
             <span class="badge status-${ev.status}">${statusLabel}</span>
           </div>
@@ -416,6 +438,20 @@ window.volunteer = async (eventId, role) => {
   try {
     await api("/api/events/volunteer", { event_id: eventId, role });
     showToast(`Volunteered as ${role}!`);
+    await loadState();
+  } catch (err) {
+    showToast(err.message);
+  }
+};
+
+window.unvolunteer = async (eventId, teacherId, role) => {
+  try {
+    await api("/api/events/unvolunteer", {
+      event_id: eventId,
+      teacher_id: teacherId,
+      role,
+    });
+    showToast(`Removed from ${role} role.`);
     await loadState();
   } catch (err) {
     showToast(err.message);

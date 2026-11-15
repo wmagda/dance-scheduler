@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS events (
 	resolved_via      TEXT NOT NULL DEFAULT '',
 	lesson_type       TEXT NOT NULL DEFAULT 'salsa',
 	lesson_detail     TEXT NOT NULL DEFAULT '',
-	dj                TEXT NOT NULL DEFAULT 'TBD',
+	dj                TEXT NOT NULL DEFAULT '',
 	notes             TEXT NOT NULL DEFAULT '',
 	need_lead         INTEGER NOT NULL DEFAULT 0,
 	need_follow       INTEGER NOT NULL DEFAULT 0,
@@ -181,6 +181,7 @@ type EventView struct {
 	HelpRequester   string          `json:"help_requester,omitempty"`
 	MyBidKind       string          `json:"my_bid_kind,omitempty"` // "", "normal", "token"
 	CanEditDetails  bool            `json:"can_edit_details"`
+	CanVolunteer    bool            `json:"can_volunteer"`
 	Volunteers      []VolunteerView `json:"volunteers"`
 	FBEventCopy     string          `json:"fb_event_copy,omitempty"`
 	AdminBids       []BidView       `json:"admin_bids,omitempty"` // populated for admin only
@@ -216,6 +217,7 @@ func Open(dbPath, baseURL, transportMode, webhookURL string) (*Store, error) {
 			return nil, err
 		}
 	}
+	_, _ = db.Exec(`UPDATE events SET dj = '' WHERE dj = 'TBD'`)
 	return s, nil
 }
 
@@ -830,8 +832,12 @@ func (s *Store) RunResolver(ctx context.Context, now time.Time, forceEventID int
 		// Announce resolution to the group (only resolutions & help flags go to group).
 		evView, err := s.GetEventView(ctx, ev.id, 0, true)
 		if err == nil {
+			djLabel := evView.DJ
+			if djLabel == "" {
+				djLabel = "TBD"
+			}
 			groupMsg := fmt.Sprintf("✅ Resolved for Thursday %s: %s is teaching (%s, DJ: %s).",
-				ev.date, winner.TeacherName, strings.Title(evView.LessonType), evView.DJ)
+				ev.date, winner.TeacherName, strings.Title(evView.LessonType), djLabel)
 			if winner.Kind == "token" {
 				groupMsg += " [Reserved with Veto Token ⭐]"
 			}
@@ -958,7 +964,7 @@ func (s *Store) nextOpenDates(ctx context.Context, afterDate string, limit int) 
 }
 
 // UpdateEventDetails updates the lesson type, DJ, notes, and help flags.
-// Permitted for the resolved winner, a tentative bidder on that date, or an admin.
+// Permitted ONLY for the resolved winner or the current tentative holder of that date.
 func (s *Store) UpdateEventDetails(ctx context.Context, actor *Teacher, eventID int64, lessonType, lessonDetail, dj, notes string, needLead, needFollow, needCo bool) error {
 	if actor == nil {
 		return errors.New("authentication required")
@@ -967,16 +973,16 @@ func (s *Store) UpdateEventDetails(ctx context.Context, actor *Teacher, eventID 
 	if err != nil {
 		return err
 	}
-	if !ev.CanEditDetails && !actor.IsAdmin {
-		return errors.New("only the assigned/bidding instructor or admin can edit event details")
+	if !ev.CanEditDetails {
+		return errors.New("only the instructor holding this date can edit its details")
 	}
 	lessonType = strings.ToLower(strings.TrimSpace(lessonType))
 	if lessonType == "" {
 		lessonType = "salsa"
 	}
 	dj = strings.TrimSpace(dj)
-	if dj == "" {
-		dj = "TBD"
+	if strings.EqualFold(dj, "TBD") {
+		dj = ""
 	}
 	b2i := func(b bool) int {
 		if b {
@@ -1014,7 +1020,8 @@ func (s *Store) UpdateEventDetails(ctx context.Context, actor *Teacher, eventID 
 	return nil
 }
 
-// VolunteerForEvent lets a teacher volunteer as lead, follow, or co-instructor.
+// VolunteerForEvent lets another teacher volunteer as lead, follow, or co-instructor.
+// The instructor teaching or bidding on the date cannot volunteer for their own lesson.
 func (s *Store) VolunteerForEvent(ctx context.Context, actor *Teacher, eventID int64, role string) error {
 	if actor == nil {
 		return errors.New("authentication required")
@@ -1022,9 +1029,12 @@ func (s *Store) VolunteerForEvent(ctx context.Context, actor *Teacher, eventID i
 	if role != "lead" && role != "follow" && role != "co" {
 		return errors.New("role must be lead, follow, or co")
 	}
-	var dateStr string
-	if err := s.db.QueryRowContext(ctx, `SELECT date FROM events WHERE id = ?`, eventID).Scan(&dateStr); err != nil {
+	ev, err := s.GetEventView(ctx, eventID, actor.ID, actor.IsAdmin)
+	if err != nil {
 		return err
+	}
+	if !ev.CanVolunteer {
+		return errors.New("you cannot volunteer as a helper on a night you are teaching or bidding on")
 	}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO confirmations(teacher_id, event_id, role) VALUES (?, ?, ?)`,
@@ -1038,7 +1048,46 @@ func (s *Store) VolunteerForEvent(ctx context.Context, actor *Teacher, eventID i
 		col = "need_co"
 	}
 	_, _ = s.db.ExecContext(ctx, fmt.Sprintf(`UPDATE events SET %s = 0 WHERE id = ?`, col), eventID)
-	_ = s.hub.PostToGroup(ctx, fmt.Sprintf("🙌 %s volunteered as %s for Thursday %s!", actor.Name, strings.Title(role), dateStr))
+	_ = s.hub.PostToGroup(ctx, fmt.Sprintf("🙌 %s volunteered as %s for Thursday %s!", actor.Name, strings.Title(role), ev.Date))
+	return nil
+}
+
+// UnvolunteerForEvent removes a volunteer from a role (e.g. if clicked by mistake)
+// and re-opens the corresponding need_lead/need_follow/need_co flag on the event.
+func (s *Store) UnvolunteerForEvent(ctx context.Context, actor *Teacher, eventID int64, teacherID int64, role string) error {
+	if actor == nil {
+		return errors.New("authentication required")
+	}
+	if role != "lead" && role != "follow" && role != "co" {
+		return errors.New("role must be lead, follow, or co")
+	}
+	if teacherID == 0 {
+		teacherID = actor.ID
+	}
+	ev, err := s.GetEventView(ctx, eventID, actor.ID, actor.IsAdmin)
+	if err != nil {
+		return err
+	}
+	if teacherID != actor.ID && !ev.CanEditDetails && !actor.IsAdmin {
+		return errors.New("you can only remove your own volunteer role")
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM confirmations WHERE event_id = ? AND teacher_id = ? AND role = ?`,
+		eventID, teacherID, role)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return errors.New("volunteer role not found")
+	}
+	col := "need_lead"
+	if role == "follow" {
+		col = "need_follow"
+	} else if role == "co" {
+		col = "need_co"
+	}
+	_, _ = s.db.ExecContext(ctx, fmt.Sprintf(`UPDATE events SET %s = 1 WHERE id = ?`, col), eventID)
 	return nil
 }
 
@@ -1127,32 +1176,34 @@ func (s *Store) queryEvents(ctx context.Context, clause string, args []any, view
 		}
 
 		isWinner := ev.WinnerTeacherID != nil && *ev.WinnerTeacherID == viewerID
-		ev.CanEditDetails = isAdmin || isWinner || ev.MyBidKind != ""
+		evTime, _ := time.Parse("2006-01-02", ev.Date)
+		ranked, _ := s.rankActiveBids(ctx, ev.ID, evTime)
+
+		isLeadingBidder := false
+		if len(ranked) > 0 && ranked[0].TeacherID == viewerID {
+			isLeadingBidder = true
+		}
+
+		if ev.Status == "resolved" || ev.Status == "done" {
+			ev.CanEditDetails = isWinner
+		} else {
+			ev.CanEditDetails = isLeadingBidder
+		}
+		ev.CanVolunteer = viewerID > 0 && !isWinner && ev.MyBidKind == ""
 
 		// Privacy rule: ONLY show bidder names on unresolved dates if help is requested
 		// (need_lead / need_follow / need_co) OR if the viewer is Admin.
 		if ev.NeedLead || ev.NeedFollow || ev.NeedCo {
 			if ev.WinnerName != "" {
 				ev.HelpRequester = ev.WinnerName
-			} else {
-				var bidderName string
-				_ = s.db.QueryRowContext(ctx, `
-					SELECT t.name FROM bids b
-					JOIN teachers t ON t.id = b.teacher_id
-					WHERE b.event_id = ? AND b.withdrawn_at IS NULL
-					ORDER BY CASE WHEN b.kind = 'token' THEN 0 ELSE 1 END, b.created_at ASC LIMIT 1
-				`, ev.ID).Scan(&bidderName)
-				ev.HelpRequester = bidderName
+			} else if len(ranked) > 0 {
+				ev.HelpRequester = ranked[0].TeacherName
 			}
 		}
 
 		if isAdmin {
-			evTime, _ := time.Parse("2006-01-02", ev.Date)
-			ranked, err := s.rankActiveBids(ctx, ev.ID, evTime)
-			if err == nil {
-				for _, rb := range ranked {
-					ev.AdminBids = append(ev.AdminBids, rb.BidView)
-				}
+			for _, rb := range ranked {
+				ev.AdminBids = append(ev.AdminBids, rb.BidView)
 			}
 		}
 
@@ -1186,6 +1237,10 @@ func FormatFacebookEvent(ev EventView) string {
 	if ev.Notes != "" {
 		notesLine = "\n\n" + ev.Notes
 	}
+	djLabel := ev.DJ
+	if djLabel == "" {
+		djLabel = "TBD"
+	}
 	return fmt.Sprintf(
 		"TITLE: Thursday Latin Dancing at Scrumpy's — %s with %s (%s)\n"+
 			"DATE: Thursday %s · 7:30 PM – 11:00 PM\n"+
@@ -1196,7 +1251,7 @@ func FormatFacebookEvent(ev EventView) string {
 		lessonLabel, instructor, ev.Date,
 		ev.Date,
 		lessonLabel, instructor, withLine,
-		ev.DJ, notesLine,
+		djLabel, notesLine,
 	)
 }
 
@@ -1217,7 +1272,11 @@ func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string
 		}
 		switch ev.Status {
 		case "resolved", "done":
-			line := fmt.Sprintf("• *%s*: %s — %s (DJ: %s)", ev.Date, ev.WinnerName, strings.Title(ev.LessonType), ev.DJ)
+			djLabel := ev.DJ
+			if djLabel == "" {
+				djLabel = "TBD"
+			}
+			line := fmt.Sprintf("• *%s*: %s — %s (DJ: %s)", ev.Date, ev.WinnerName, strings.Title(ev.LessonType), djLabel)
 			if ev.NeedLead || ev.NeedFollow || ev.NeedCo {
 				line += " ⚠️ *[Needs Lead/Follow Help!]*"
 			}
