@@ -7,8 +7,11 @@ import (
 	"embed"
 	"encoding/json"
 	"io/fs"
+	"log"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wojtek/dance-scheduler/internal/store"
@@ -19,22 +22,102 @@ var staticFS embed.FS
 
 const sessionCookieName = "dance_session"
 
+// OTP endpoint rate limits (sliding window, per process).
+const (
+	otpWindow             = 15 * time.Minute
+	otpRequestMaxPerPhone = 3
+	otpRequestMaxPerIP    = 15
+	otpRequestIPWindow    = time.Hour
+	otpVerifyMaxPerPhone  = 10
+)
+
 type Server struct {
 	store *store.Store
 	mux   *http.ServeMux
+
+	rateMu sync.Mutex
+	otpReq map[string][]time.Time // request-otp hits, keyed "phone:.." / "ip:.."
+	otpVer map[string][]time.Time // verify-otp attempts, keyed "phone:.."
 }
 
 func New(st *store.Store) *Server {
 	s := &Server{
-		store: st,
-		mux:   http.NewServeMux(),
+		store:  st,
+		mux:    http.NewServeMux(),
+		otpReq: make(map[string][]time.Time),
+		otpVer: make(map[string][]time.Time),
 	}
 	s.routes()
 	return s
 }
 
+// ServeHTTP is the public perimeter: the bot webhook is localhost-only and
+// every /api route except the two login endpoints requires a session. Static
+// assets stay public so the login page renders for unauthenticated visitors.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/api/bot/inbound" {
+		if !isLocalRequest(r, ipIsLoopback) {
+			writeErr(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/") &&
+		r.URL.Path != "/api/auth/request-otp" &&
+		r.URL.Path != "/api/auth/verify-otp" &&
+		r.URL.Path != "/api/auth/logout" {
+		if s.currentTeacher(r) == nil {
+			writeErr(w, http.StatusUnauthorized, "login required")
+			return
+		}
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+type ipPredicate func(net.IP) bool
+
+func ipIsLoopback(ip net.IP) bool { return ip.IsLoopback() }
+
+// isPrivateRequest reports whether the request originates from the local
+// machine or LAN (loopback or RFC1918) — used to keep manual-mode OTP codes
+// and other local conveniences off the public internet.
+func isPrivateRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
+}
+
+func isLocalRequest(r *http.Request, pred ipPredicate) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && pred(ip)
+}
+
+// allow records a hit for key and reports whether it stays within max over
+// the sliding window.
+func (s *Server) allow(hits map[string][]time.Time, key string, max int, window time.Duration) bool {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	now := time.Now()
+	kept := hits[key][:0]
+	for _, t := range hits[key] {
+		if now.Sub(t) < window {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= max {
+		hits[key] = kept
+		return false
+	}
+	hits[key] = append(kept, now)
+	return true
 }
 
 func (s *Server) routes() {
@@ -150,8 +233,20 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	code, err := s.store.RequestOTP(r.Context(), req.Phone, time.Now().UTC())
+	phone := strings.TrimSpace(req.Phone)
+	if !s.allow(s.otpReq, "phone:"+phone, otpRequestMaxPerPhone, otpWindow) {
+		writeErr(w, http.StatusTooManyRequests, "too many code requests for this number — try again in a few minutes")
+		return
+	}
+	ipKey := "ip:" + clientIP(r)
+	if !s.allow(s.otpReq, ipKey, otpRequestMaxPerIP, otpRequestIPWindow) {
+		writeErr(w, http.StatusTooManyRequests, "too many code requests from this network — try again later")
+		return
+	}
+	code, err := s.store.RequestOTP(r.Context(), phone, time.Now().UTC())
 	if err != nil {
+		// Roster membership stays visible to the requester (helpful for
+		// onboarding) but the endpoint itself is rate-limited above.
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -160,11 +255,25 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 		"transport_mode": s.store.Hub().Name(),
 	}
 	// In manual mode (before the WhatsApp bot is linked), surface the OTP code
-	// directly in the response so local/LAN onboarding works out of the box.
+	// directly in the response — but ONLY for local/LAN requests. Over the
+	// public internet the code goes to scheduler.log instead, so a stranger
+	// cannot mint their own session.
 	if s.store.Hub().Name() == "manual" {
-		resp["manual_mode_code"] = code
+		if isPrivateRequest(r) {
+			resp["manual_mode_code"] = code
+		} else {
+			log.Printf("otp: manual-mode code for %s suppressed from response (non-local request), code=%s", phone, code)
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
@@ -174,6 +283,12 @@ func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	// Cap guessing: 10 attempts per number per 15 min against a 6-digit code
+	// valid for 10 minutes keeps brute-force odds negligible.
+	if !s.allow(s.otpVer, "phone:"+strings.TrimSpace(req.Phone), otpVerifyMaxPerPhone, otpWindow) {
+		writeErr(w, http.StatusTooManyRequests, "too many attempts — request a new code in a few minutes")
 		return
 	}
 	tok, teacher, err := s.store.VerifyOTP(r.Context(), req.Phone, req.Code, time.Now().UTC())

@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -1338,7 +1339,7 @@ func (s *Store) VerifyOTP(ctx context.Context, phone, code string, now time.Time
 	if err != nil || now.UTC().After(expTime) {
 		return "", nil, errors.New("login code expired — request a new code")
 	}
-	if strings.TrimSpace(code) != savedCode {
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(code)), []byte(savedCode)) != 1 {
 		return "", nil, errors.New("invalid 6-digit code")
 	}
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM otp_codes WHERE phone = ?`, t.Phone)
