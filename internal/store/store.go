@@ -360,6 +360,45 @@ func (s *Store) RemoveTeacher(ctx context.Context, teacherID int64) error {
 	return err
 }
 
+// GetInviteToken returns the current self-signup invite token, generating one
+// on first use. The token is shared via a link posted in the WhatsApp group,
+// so possession of the token approximates group membership.
+func (s *Store) GetInviteToken(ctx context.Context) (string, error) {
+	var val string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM config WHERE key = 'invite_token'`).Scan(&val)
+	if err == sql.ErrNoRows || (err == nil && strings.TrimSpace(val) == "") {
+		return s.RotateInviteToken(ctx)
+	}
+	return val, err
+}
+
+// RotateInviteToken replaces the invite token, invalidating previously shared
+// signup links.
+func (s *Store) RotateInviteToken(ctx context.Context) (string, error) {
+	raw := make([]byte, 12)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	tok := hex.EncodeToString(raw)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO config(key, value) VALUES ('invite_token', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, tok); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+// ValidateInviteToken reports whether the supplied signup token matches the
+// current one (constant-time compare).
+func (s *Store) ValidateInviteToken(ctx context.Context, token string) bool {
+	tok, err := s.GetInviteToken(ctx)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(tok)) == 1
+}
+
 func (s *Store) EnsureYearTokens(ctx context.Context, teacherID int64, year int) error {
 	if year <= 0 {
 		year = time.Now().UTC().Year()

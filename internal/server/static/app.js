@@ -9,7 +9,13 @@ let STATE = {
   outbox: [],
   selectedMonth: "all",
   openEditEventId: null,
+  invite: new URLSearchParams(location.search).get("invite") || "",
 };
+
+function setInviteUI(token) {
+  const el = document.getElementById("adm-invite-url");
+  if (el && token) el.value = `${location.origin}/?invite=${token}`;
+}
 
 function showToast(msg) {
   const el = document.getElementById("toast");
@@ -334,6 +340,7 @@ function renderDigests() {
 function renderAdmin() {
   if (!STATE.viewer || !STATE.viewer.is_admin) return;
   document.getElementById("transport-mode-label").textContent = STATE.transport_mode;
+  setInviteUI(STATE.invite_token);
 
   document.getElementById("admin-roster-list").innerHTML = STATE.teachers
     .map(
@@ -525,7 +532,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const phone = document.getElementById("login-phone").value.trim();
     if (!phone) return showToast("Enter your phone number");
     try {
-      const res = await api("/api/auth/request-otp", { phone });
+      const res = await api("/api/auth/request-otp", {
+        phone,
+        name: document.getElementById("signup-name").value.trim(),
+        invite: STATE.invite || document.getElementById("signup-invite").value.trim(),
+      });
       document.getElementById("otp-step-phone").classList.add("hidden");
       document.getElementById("otp-step-code").classList.remove("hidden");
       const hint = document.getElementById("otp-hint");
@@ -557,6 +568,25 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-reset-otp").onclick = () => {
     document.getElementById("otp-step-code").classList.add("hidden");
     document.getElementById("otp-step-phone").classList.remove("hidden");
+  };
+
+  document.getElementById("signup-toggle").onclick = (e) => {
+    e.preventDefault();
+    document.getElementById("signup-fields").classList.toggle("hidden");
+  };
+
+  document.getElementById("btn-copy-invite").onclick = () => {
+    copyText(document.getElementById("adm-invite-url").value);
+  };
+
+  document.getElementById("btn-rotate-invite").onclick = async () => {
+    try {
+      const res = await api("/api/admin/invite/rotate", {});
+      setInviteUI(res.invite_token);
+      showToast("Invite link rotated — old link is dead.");
+    } catch (err) {
+      showToast(err.message);
+    }
   };
 
   document.getElementById("btn-copy-digest").onclick = () => {

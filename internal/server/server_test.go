@@ -279,3 +279,72 @@ func TestVerifyOTPAttemptCap(t *testing.T) {
 		t.Fatalf("attempt cap: want 429, got %d", resp.StatusCode)
 	}
 }
+
+// Invite-gated self-signup: a non-roster phone can register only with the
+// current invite token, obtained via the admin invite endpoints.
+func TestInviteSignupFlow(t *testing.T) {
+	srv := newTestServer(t)
+
+	// 1. Unknown phone without invite -> forbidden.
+	body, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person"})
+	resp, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("request-otp: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("no-invite signup: want 403, got %d", resp.StatusCode)
+	}
+
+	// 2. Login as admin and fetch the invite token.
+	cookie := loginSession(t, srv.URL)
+	req, _ := http.NewRequest("GET", srv.URL+"/api/admin/invite", nil)
+	req.AddCookie(cookie)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get invite: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != 200 {
+		t.Fatalf("get invite: want 200, got %d", resp2.StatusCode)
+	}
+	var inv struct {
+		InviteToken string `json:"invite_token"`
+	}
+	_ = json.NewDecoder(resp2.Body).Decode(&inv)
+	if len(inv.InviteToken) < 16 {
+		t.Fatalf("expected invite token, got %q", inv.InviteToken)
+	}
+
+	// 3. Bad token still rejected.
+	bodyBad, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person", "invite": "deadbeefdeadbeef"})
+	resp3, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(bodyBad))
+	if err != nil {
+		t.Fatalf("request-otp bad invite: %v", err)
+	}
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("bad-invite signup: want 403, got %d", resp3.StatusCode)
+	}
+
+	// 4. Valid token + name -> signup succeeds and login works end-to-end.
+	bodyOK, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person", "invite": inv.InviteToken})
+	resp4, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(bodyOK))
+	if err != nil {
+		t.Fatalf("request-otp signup: %v", err)
+	}
+	var otpResp struct {
+		ManualModeCode string `json:"manual_mode_code"`
+	}
+	_ = json.NewDecoder(resp4.Body).Decode(&otpResp)
+	resp4.Body.Close()
+	if resp4.StatusCode != 200 || len(otpResp.ManualModeCode) != 6 {
+		t.Fatalf("invite signup: want 200+code, got %d code=%q", resp4.StatusCode, otpResp.ManualModeCode)
+	}
+	verBody, _ := json.Marshal(map[string]string{"phone": "9705550199", "code": otpResp.ManualModeCode})
+	resp5, err := http.Post(srv.URL+"/api/auth/verify-otp", "application/json", bytes.NewReader(verBody))
+	if err != nil || resp5.StatusCode != 200 {
+		t.Fatalf("verify-otp after signup: status=%v err=%v", resp5.StatusCode, err)
+	}
+	resp5.Body.Close()
+}

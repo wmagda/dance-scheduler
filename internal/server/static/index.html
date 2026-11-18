@@ -41,6 +41,11 @@
         <button class="btn primary" id="btn-verify-otp">Verify &amp; Sign In</button>
         <button class="btn ghost" id="btn-reset-otp">Back</button>
       </div>
+      <div class="login-row hidden" id="signup-fields">
+        <input type="text" id="signup-name" placeholder="Your name" />
+        <input type="text" id="signup-invite" placeholder="Invite code" />
+      </div>
+      <p class="muted" id="signup-toggle-row">New instructor? <a href="#" id="signup-toggle">Sign up here</a> (invite link from the WhatsApp group)</p>
       <p id="otp-hint" class="otp-hint hidden"></p>
     </section>
 
@@ -115,8 +120,15 @@
         </div>
 
         <div class="card">
+          <h2>Invite Link (Self-Signup)</h2>
+          <div class="login-row">
+            <input type="text" id="adm-invite-url" readonly />
+            <button class="btn small" id="btn-copy-invite">Copy</button>
+            <button class="btn small gold" id="btn-rotate-invite">Rotate</button>
+          </div>
+          <p class="muted">Share this in the WhatsApp group — new instructors sign up with name + phone. Rotating kills the old link instantly.</p>
+          <h2>Scheduler Parameters &amp; Resolver</h2>
           <div class="card-head">
-            <h2>Scheduler Parameters &amp; Resolver</h2>
             <button class="btn primary small" id="btn-run-resolver">Run Resolver &amp; Recruitment Sweep Now</button>
           </div>
           <form id="form-config" class="stack-form">

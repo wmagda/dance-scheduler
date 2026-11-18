@@ -139,6 +139,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/admin/tokens/grant", s.handleAdminGrantToken)
 	s.mux.HandleFunc("POST /api/admin/config", s.handleAdminUpdateConfig)
 	s.mux.HandleFunc("POST /api/admin/resolve", s.handleAdminResolve)
+	s.mux.HandleFunc("GET /api/admin/invite", s.handleAdminGetInvite)
+	s.mux.HandleFunc("POST /api/admin/invite/rotate", s.handleAdminRotateInvite)
 
 	sub, _ := fs.Sub(staticFS, "static")
 	s.mux.Handle("/", http.FileServer(http.FS(sub)))
@@ -209,8 +211,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	digest, _ := s.store.GenerateWeeklyDigest(ctx, now)
 
 	var outbox []store.OutboxEntry
+	inviteToken := ""
 	if isAdmin {
 		outbox, _ = s.store.ListOutbox(ctx, 50)
+		inviteToken, _ = s.store.GetInviteToken(ctx)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -222,12 +226,15 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"transport_mode": s.store.Hub().Name(),
 		"digest":         digest,
 		"outbox":         outbox,
+		"invite_token":   inviteToken,
 	})
 }
 
 func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Phone string `json:"phone"`
+		Phone  string `json:"phone"`
+		Name   string `json:"name,omitempty"`
+		Invite string `json:"invite,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
@@ -242,6 +249,23 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 	if !s.allow(s.otpReq, ipKey, otpRequestMaxPerIP, otpRequestIPWindow) {
 		writeErr(w, http.StatusTooManyRequests, "too many code requests from this network — try again later")
 		return
+	}
+	// Invite-gated self-signup: a number not on the roster may register itself
+	// (name + phone) only when it presents the current invite token from the
+	// group link. Everyone else gets the standard roster error.
+	if _, err := s.store.GetTeacherByPhone(r.Context(), phone); err != nil {
+		if !s.store.ValidateInviteToken(r.Context(), req.Invite) {
+			writeErr(w, http.StatusForbidden, "not on the instructor roster — use the invite link from the WhatsApp group, or ask an admin to add you")
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeErr(w, http.StatusBadRequest, "your name is required to sign up")
+			return
+		}
+		if _, err := s.store.CreateTeacher(r.Context(), req.Name, phone, "", false, time.Now().UTC().Year()); err != nil {
+			writeErr(w, http.StatusBadRequest, "signup failed: "+err.Error())
+			return
+		}
 	}
 	code, err := s.store.RequestOTP(r.Context(), phone, time.Now().UTC())
 	if err != nil {
@@ -538,6 +562,30 @@ func (s *Server) handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request)
 	}
 	_ = s.store.EnsureUpcomingThursdays(r.Context(), time.Now().UTC())
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleAdminGetInvite(w http.ResponseWriter, r *http.Request) {
+	if s.requireAdmin(w, r) == nil {
+		return
+	}
+	tok, err := s.store.GetInviteToken(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"invite_token": tok})
+}
+
+func (s *Server) handleAdminRotateInvite(w http.ResponseWriter, r *http.Request) {
+	if s.requireAdmin(w, r) == nil {
+		return
+	}
+	tok, err := s.store.RotateInviteToken(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"invite_token": tok})
 }
 
 func (s *Server) handleAdminResolve(w http.ResponseWriter, r *http.Request) {
