@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/mail"
 	"regexp"
 	"sort"
 	"strconv"
@@ -21,6 +22,10 @@ import (
 
 	"github.com/wojtek/dance-scheduler/internal/transport"
 )
+
+// ErrInvalidInvite is returned when self-signup is attempted with a missing,
+// revoked, or expired invite token.
+var ErrInvalidInvite = errors.New("invite link is invalid or expired — ask an admin for a fresh invite link")
 
 const schema = `
 PRAGMA journal_mode = WAL;
@@ -34,7 +39,8 @@ CREATE TABLE IF NOT EXISTS config (
 CREATE TABLE IF NOT EXISTS teachers (
 	id            INTEGER PRIMARY KEY AUTOINCREMENT,
 	name          TEXT NOT NULL,
-	phone         TEXT NOT NULL UNIQUE,
+	phone         TEXT NOT NULL DEFAULT '',
+	email         TEXT NOT NULL DEFAULT '',
 	handle        TEXT NOT NULL DEFAULT '',
 	is_admin      INTEGER NOT NULL DEFAULT 0,
 	active        INTEGER NOT NULL DEFAULT 1,
@@ -90,10 +96,12 @@ CREATE TABLE IF NOT EXISTS confirmations (
 );
 
 CREATE TABLE IF NOT EXISTS otp_codes (
-	phone      TEXT NOT NULL,
-	code       TEXT NOT NULL,
-	expires_at TEXT NOT NULL,
-	created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	target        TEXT PRIMARY KEY,
+	code          TEXT NOT NULL,
+	pending_name  TEXT NOT NULL DEFAULT '',
+	pending_phone TEXT NOT NULL DEFAULT '',
+	expires_at    TEXT NOT NULL,
+	created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -118,6 +126,7 @@ var defaultConfig = map[string]string{
 	"recruit_days_before":  "14",
 	"tokens_per_year":      "2",
 	"months_open_ahead":    "6",
+	"invite_ttl_days":      "7",
 }
 
 type Store struct {
@@ -129,6 +138,7 @@ type Store struct {
 type Teacher struct {
 	ID              int64      `json:"id"`
 	Name            string     `json:"name"`
+	Email           string     `json:"email"`
 	Phone           string     `json:"phone"`
 	Handle          string     `json:"handle"`
 	IsAdmin         bool       `json:"is_admin"`
@@ -137,6 +147,12 @@ type Teacher struct {
 	TokensAvailable int        `json:"tokens_available"`
 	TokensTotal     int        `json:"tokens_total"`
 	TokensUsed      []TokenUse `json:"tokens_used,omitempty"`
+}
+
+type InviteStatus struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+	Active    bool   `json:"active"`
 }
 
 type TokenUse struct {
@@ -197,6 +213,10 @@ type OutboxEntry struct {
 }
 
 func Open(dbPath, baseURL, transportMode, webhookURL string) (*Store, error) {
+	return OpenWithEmail(dbPath, baseURL, transportMode, webhookURL, transport.EmailConfig{})
+}
+
+func OpenWithEmail(dbPath, baseURL, transportMode, webhookURL string, emailCfg transport.EmailConfig) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
@@ -206,11 +226,15 @@ func Open(dbPath, baseURL, transportMode, webhookURL string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := migrateSchema(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	s := &Store{
 		db:      db,
 		baseURL: strings.TrimRight(baseURL, "/"),
 	}
-	s.hub = transport.NewHub(transportMode, webhookURL, s.RecordOutbox)
+	s.hub = transport.NewHubWithEmail(transportMode, webhookURL, emailCfg, s.RecordOutbox)
 
 	for k, v := range defaultConfig {
 		if _, err := db.Exec(`INSERT OR IGNORE INTO config(key, value) VALUES (?, ?)`, k, v); err != nil {
@@ -220,6 +244,90 @@ func Open(dbPath, baseURL, transportMode, webhookURL string) (*Store, error) {
 	}
 	_, _ = db.Exec(`UPDATE events SET dj = '' WHERE dj = 'TBD'`)
 	return s, nil
+}
+
+// migrateSchema upgrades older SQLite databases (where teachers had UNIQUE
+// NOT NULL phone without an email column, and otp_codes keyed on phone only)
+// in place without losing roster, token, or event rows.
+func migrateSchema(db *sql.DB) error {
+	hasCol := func(table, col string) (bool, error) {
+		rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+		if err != nil {
+			return false, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+				return false, err
+			}
+			if name == col {
+				return true, nil
+			}
+		}
+		return false, rows.Err()
+	}
+
+	hasEmail, err := hasCol("teachers", "email")
+	if err != nil {
+		return err
+	}
+	if !hasEmail {
+		stmts := `
+			PRAGMA foreign_keys = OFF;
+			BEGIN TRANSACTION;
+			CREATE TABLE teachers_new (
+				id            INTEGER PRIMARY KEY AUTOINCREMENT,
+				name          TEXT NOT NULL,
+				phone         TEXT NOT NULL DEFAULT '',
+				email         TEXT NOT NULL DEFAULT '',
+				handle        TEXT NOT NULL DEFAULT '',
+				is_admin      INTEGER NOT NULL DEFAULT 0,
+				active        INTEGER NOT NULL DEFAULT 1,
+				created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			INSERT INTO teachers_new(id, name, phone, email, handle, is_admin, active, created_at)
+			SELECT id, name, COALESCE(phone, ''), '', COALESCE(handle, ''), is_admin, active, created_at FROM teachers;
+			DROP TABLE teachers;
+			ALTER TABLE teachers_new RENAME TO teachers;
+			COMMIT;
+			PRAGMA foreign_keys = ON;
+		`
+		if _, err := db.Exec(stmts); err != nil {
+			_, _ = db.Exec(`ROLLBACK; PRAGMA foreign_keys = ON;`)
+			return err
+		}
+	}
+	if _, err := db.Exec(`
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_teachers_email ON teachers(email) WHERE email != '';
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_teachers_phone ON teachers(phone) WHERE phone != '';
+	`); err != nil {
+		return err
+	}
+
+	hasTarget, err := hasCol("otp_codes", "target")
+	if err != nil {
+		return err
+	}
+	if !hasTarget {
+		if _, err := db.Exec(`
+			DROP TABLE IF EXISTS otp_codes;
+			CREATE TABLE otp_codes (
+				target        TEXT PRIMARY KEY,
+				code          TEXT NOT NULL,
+				pending_name  TEXT NOT NULL DEFAULT '',
+				pending_phone TEXT NOT NULL DEFAULT '',
+				expires_at    TEXT NOT NULL,
+				created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+		`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -240,6 +348,26 @@ func NormalizePhone(p string) string {
 		return "+" + p
 	}
 	return p
+}
+
+func NormalizeEmail(e string) string {
+	return strings.ToLower(strings.TrimSpace(e))
+}
+
+func ValidateEmail(e string) (string, error) {
+	norm := NormalizeEmail(e)
+	if norm == "" {
+		return "", errors.New("email address is required")
+	}
+	addr, err := mail.ParseAddress(norm)
+	if err != nil || addr.Address != norm || !strings.Contains(norm, "@") {
+		return "", errors.New("invalid email address")
+	}
+	parts := strings.SplitN(norm, "@", 2)
+	if len(parts) != 2 || !strings.Contains(parts[1], ".") {
+		return "", errors.New("invalid email domain")
+	}
+	return norm, nil
 }
 
 func (s *Store) RecordOutbox(ctx context.Context, ch transport.Channel, recipient, body string) error {
@@ -270,6 +398,8 @@ func (s *Store) ListOutbox(ctx context.Context, limit int) ([]OutboxEntry, error
 	return out, rows.Err()
 }
 
+// GetConfigMap returns public numeric scheduler parameters, excluding secret
+// invite token fields so non-admin state payloads never expose them.
 func (s *Store) GetConfigMap(ctx context.Context) (map[string]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM config`)
 	if err != nil {
@@ -285,7 +415,9 @@ func (s *Store) GetConfigMap(ctx context.Context) (map[string]string, error) {
 		if err := rows.Scan(&k, &v); err != nil {
 			return nil, err
 		}
-		m[k] = v
+		if _, ok := defaultConfig[k]; ok {
+			m[k] = v
+		}
 	}
 	return m, rows.Err()
 }
@@ -321,38 +453,81 @@ func (s *Store) UpdateConfig(ctx context.Context, updates map[string]string) err
 	return nil
 }
 
-// CreateTeacher adds or reactivates a teacher in the roster and ensures their
-// annual veto token allocation for the current year.
-func (s *Store) CreateTeacher(ctx context.Context, name, phone, handle string, isAdmin bool, year int) (*Teacher, error) {
-	name = strings.TrimSpace(name)
-	phone = NormalizePhone(phone)
-	if name == "" || phone == "" {
-		return nil, errors.New("name and phone are required")
+// CreateTeacher is a convenience wrapper around SaveTeacher where `contact` may
+// be either an email address or a phone number.
+func (s *Store) CreateTeacher(ctx context.Context, name, contact, handle string, isAdmin bool, year int) (*Teacher, error) {
+	if strings.Contains(contact, "@") {
+		return s.SaveTeacher(ctx, name, contact, "", handle, isAdmin, year)
 	}
+	return s.SaveTeacher(ctx, name, "", contact, handle, isAdmin, year)
+}
+
+// SaveTeacher adds, updates, or reactivates a teacher in the roster (matching by
+// email or phone if already present) and ensures their annual veto tokens.
+func (s *Store) SaveTeacher(ctx context.Context, name, email, phone, handle string, isAdmin bool, year int) (*Teacher, error) {
+	name = strings.TrimSpace(name)
+	handle = strings.TrimSpace(handle)
+	phone = NormalizePhone(phone)
+	if strings.TrimSpace(email) != "" {
+		validEmail, err := ValidateEmail(email)
+		if err != nil {
+			return nil, err
+		}
+		email = validEmail
+	} else {
+		email = ""
+	}
+	if name == "" {
+		return nil, errors.New("instructor name is required")
+	}
+	if email == "" && phone == "" {
+		return nil, errors.New("email address (or phone number) is required")
+	}
+
 	adminInt := 0
 	if isAdmin {
 		adminInt = 1
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO teachers(name, phone, handle, is_admin, active)
-		VALUES (?, ?, ?, ?, 1)
-		ON CONFLICT(phone) DO UPDATE SET
-			name = excluded.name,
-			handle = CASE WHEN excluded.handle != '' THEN excluded.handle ELSE teachers.handle END,
-			is_admin = CASE WHEN excluded.is_admin = 1 THEN 1 ELSE teachers.is_admin END,
-			active = 1
-	`, name, phone, strings.TrimSpace(handle), adminInt)
-	if err != nil {
+
+	// Find any existing row matching email or phone (including inactive rows) so we
+	// update in place — e.g. attaching an email to an existing phone-bootstrapped admin.
+	var existingID int64
+	if email != "" {
+		_ = s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE email = ?`, email).Scan(&existingID)
+	}
+	if existingID == 0 && phone != "" {
+		_ = s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE phone = ?`, phone).Scan(&existingID)
+	}
+
+	if existingID > 0 {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE teachers
+			SET name = ?,
+			    email = CASE WHEN ? != '' THEN ? ELSE email END,
+			    phone = CASE WHEN ? != '' THEN ? ELSE phone END,
+			    handle = CASE WHEN ? != '' THEN ? ELSE handle END,
+			    is_admin = CASE WHEN ? = 1 THEN 1 ELSE is_admin END,
+			    active = 1
+			WHERE id = ?
+		`, name, email, email, phone, phone, handle, handle, adminInt, existingID)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		res, err := s.db.ExecContext(ctx, `
+			INSERT INTO teachers(name, email, phone, handle, is_admin, active)
+			VALUES (?, ?, ?, ?, ?, 1)
+		`, name, email, phone, handle, adminInt)
+		if err != nil {
+			return nil, err
+		}
+		existingID, _ = res.LastInsertId()
+	}
+
+	if err := s.EnsureYearTokens(ctx, existingID, year); err != nil {
 		return nil, err
 	}
-	t, err := s.GetTeacherByPhone(ctx, phone)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.EnsureYearTokens(ctx, t.ID, year); err != nil {
-		return nil, err
-	}
-	return s.GetTeacherByID(ctx, t.ID, time.Now().UTC())
+	return s.GetTeacherByID(ctx, existingID, time.Now().UTC())
 }
 
 func (s *Store) RemoveTeacher(ctx context.Context, teacherID int64) error {
@@ -360,43 +535,102 @@ func (s *Store) RemoveTeacher(ctx context.Context, teacherID int64) error {
 	return err
 }
 
-// GetInviteToken returns the current self-signup invite token, generating one
-// on first use. The token is shared via a link posted in the WhatsApp group,
-// so possession of the token approximates group membership.
-func (s *Store) GetInviteToken(ctx context.Context) (string, error) {
-	var val string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT value FROM config WHERE key = 'invite_token'`).Scan(&val)
-	if err == sql.ErrNoRows || (err == nil && strings.TrimSpace(val) == "") {
-		return s.RotateInviteToken(ctx)
+// GetInviteStatus returns the current self-signup invite token, its expiration
+// timestamp, and whether it is currently active. On a brand-new database where
+// no invite token has ever been configured, it mints an initial token expiring
+// in invite_ttl_days (default 7d). Once expired or revoked, it stays inactive
+// until an admin explicitly mints a new link.
+func (s *Store) GetInviteStatus(ctx context.Context, now time.Time) (InviteStatus, error) {
+	var tok string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM config WHERE key = 'invite_token'`).Scan(&tok)
+	if err == sql.ErrNoRows {
+		return s.RotateInviteToken(ctx, now, 0)
 	}
-	return val, err
+	if err != nil {
+		return InviteStatus{}, err
+	}
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return InviteStatus{Active: false}, nil
+	}
+
+	var expStr string
+	err = s.db.QueryRowContext(ctx, `SELECT value FROM config WHERE key = 'invite_expires_at'`).Scan(&expStr)
+	if err == sql.ErrNoRows || strings.TrimSpace(expStr) == "" {
+		// Upgrade legacy unexpiring token to a bounded TTL starting now.
+		ttlDays := s.GetConfigInt(ctx, "invite_ttl_days", 7)
+		if ttlDays <= 0 {
+			ttlDays = 7
+		}
+		expStr = now.UTC().AddDate(0, 0, ttlDays).Format(time.RFC3339)
+		_, _ = s.db.ExecContext(ctx, `
+			INSERT INTO config(key, value) VALUES ('invite_expires_at', ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, expStr)
+	} else if err != nil {
+		return InviteStatus{}, err
+	}
+
+	expTime, parseErr := time.Parse(time.RFC3339, expStr)
+	active := parseErr == nil && !now.UTC().After(expTime)
+	return InviteStatus{
+		Token:     tok,
+		ExpiresAt: expStr,
+		Active:    active,
+	}, nil
 }
 
-// RotateInviteToken replaces the invite token, invalidating previously shared
-// signup links.
-func (s *Store) RotateInviteToken(ctx context.Context) (string, error) {
+// RotateInviteToken mints a fresh invite token valid for ttlDays (defaults to
+// invite_ttl_days config, 7 days), immediately invalidating any previous link.
+func (s *Store) RotateInviteToken(ctx context.Context, now time.Time, ttlDays int) (InviteStatus, error) {
+	if ttlDays <= 0 {
+		ttlDays = s.GetConfigInt(ctx, "invite_ttl_days", 7)
+		if ttlDays <= 0 {
+			ttlDays = 7
+		}
+	}
 	raw := make([]byte, 12)
 	if _, err := rand.Read(raw); err != nil {
-		return "", err
+		return InviteStatus{}, err
 	}
 	tok := hex.EncodeToString(raw)
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO config(key, value) VALUES ('invite_token', ?)
-		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, tok); err != nil {
-		return "", err
+	expStr := now.UTC().AddDate(0, 0, ttlDays).Format(time.RFC3339)
+	for k, v := range map[string]string{
+		"invite_token":      tok,
+		"invite_expires_at": expStr,
+	} {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO config(key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			return InviteStatus{}, err
+		}
 	}
-	return tok, nil
+	return InviteStatus{Token: tok, ExpiresAt: expStr, Active: true}, nil
+}
+
+// RevokeInviteToken disables self-signup until an admin mints a new link.
+func (s *Store) RevokeInviteToken(ctx context.Context) error {
+	for _, k := range []string{"invite_token", "invite_expires_at"} {
+		if _, err := s.db.ExecContext(ctx, `
+			INSERT INTO config(key, value) VALUES (?, '')
+			ON CONFLICT(key) DO UPDATE SET value = ''`, k); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ValidateInviteToken reports whether the supplied signup token matches the
-// current one (constant-time compare).
-func (s *Store) ValidateInviteToken(ctx context.Context, token string) bool {
-	tok, err := s.GetInviteToken(ctx)
-	if err != nil {
+// current active, non-expired invite token (constant-time compare).
+func (s *Store) ValidateInviteToken(ctx context.Context, token string, now time.Time) bool {
+	supplied := strings.TrimSpace(token)
+	if supplied == "" {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(strings.TrimSpace(token)), []byte(tok)) == 1
+	st, err := s.GetInviteStatus(ctx, now)
+	if err != nil || !st.Active || st.Token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(st.Token)) == 1
 }
 
 func (s *Store) EnsureYearTokens(ctx context.Context, teacherID int64, year int) error {
@@ -487,6 +721,9 @@ func (s *Store) FairnessScore(ctx context.Context, teacherID int64, refDate time
 
 func (s *Store) GetTeacherByPhone(ctx context.Context, phone string) (*Teacher, error) {
 	phone = NormalizePhone(phone)
+	if phone == "" {
+		return nil, sql.ErrNoRows
+	}
 	var id int64
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE phone = ? AND active = 1`, phone).Scan(&id)
 	if err != nil {
@@ -495,12 +732,32 @@ func (s *Store) GetTeacherByPhone(ctx context.Context, phone string) (*Teacher, 
 	return s.GetTeacherByID(ctx, id, time.Now().UTC())
 }
 
+func (s *Store) GetTeacherByEmail(ctx context.Context, email string) (*Teacher, error) {
+	email = NormalizeEmail(email)
+	if email == "" {
+		return nil, sql.ErrNoRows
+	}
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE email = ? AND active = 1`, email).Scan(&id)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetTeacherByID(ctx, id, time.Now().UTC())
+}
+
+func (s *Store) GetTeacherByContact(ctx context.Context, contact string) (*Teacher, error) {
+	if strings.Contains(contact, "@") {
+		return s.GetTeacherByEmail(ctx, contact)
+	}
+	return s.GetTeacherByPhone(ctx, contact)
+}
+
 func (s *Store) GetTeacherByID(ctx context.Context, id int64, refTime time.Time) (*Teacher, error) {
 	var t Teacher
 	var isAdmin, active int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, phone, handle, is_admin, active FROM teachers WHERE id = ?`, id,
-	).Scan(&t.ID, &t.Name, &t.Phone, &t.Handle, &isAdmin, &active)
+		`SELECT id, name, email, phone, handle, is_admin, active FROM teachers WHERE id = ?`, id,
+	).Scan(&t.ID, &t.Name, &t.Email, &t.Phone, &t.Handle, &isAdmin, &active)
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +975,7 @@ type rankedBid struct {
 // 4. Lowest bid ID
 func (s *Store) rankActiveBids(ctx context.Context, eventID int64, eventDate time.Time) ([]rankedBid, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT b.id, b.teacher_id, t.name, t.phone, t.handle, b.kind, b.created_at
+		SELECT b.id, b.teacher_id, t.name, t.email, t.phone, t.handle, b.kind, b.created_at
 		FROM bids b
 		JOIN teachers t ON t.id = b.teacher_id
 		WHERE b.event_id = ? AND b.withdrawn_at IS NULL AND t.active = 1
@@ -729,7 +986,7 @@ func (s *Store) rankActiveBids(ctx context.Context, eventID int64, eventDate tim
 	var list []rankedBid
 	for rows.Next() {
 		var rb rankedBid
-		if err := rows.Scan(&rb.ID, &rb.TeacherID, &rb.TeacherName, &rb.recipient.Phone, &rb.recipient.Handle, &rb.Kind, &rb.CreatedAt); err != nil {
+		if err := rows.Scan(&rb.ID, &rb.TeacherID, &rb.TeacherName, &rb.recipient.Email, &rb.recipient.Phone, &rb.recipient.Handle, &rb.Kind, &rb.CreatedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -941,7 +1198,7 @@ func (s *Store) RunRecruitment(ctx context.Context, now time.Time) (recruited in
 		}
 		for _, t := range teachers[:limit] {
 			_ = s.hub.SendDM(ctx, transport.Recipient{
-				TeacherID: t.ID, Name: t.Name, Phone: t.Phone, Handle: t.Handle,
+				TeacherID: t.ID, Name: t.Name, Email: t.Email, Phone: t.Phone, Handle: t.Handle,
 			}, fmt.Sprintf("Hey %s — Thursday %s is still open and you're at the top of the fairness priority list (%d nights in the last 90d). Want to teach? Claim it: %s",
 				t.Name, ev.date, t.FairnessScore, s.baseURL))
 		}
@@ -974,7 +1231,7 @@ func (s *Store) RunRecruitment(ctx context.Context, now time.Time) (recruited in
 		for _, t := range teachers {
 			if t.IsAdmin {
 				_ = s.hub.SendDM(ctx, transport.Recipient{
-					TeacherID: t.ID, Name: t.Name, Phone: t.Phone, Handle: t.Handle,
+					TeacherID: t.ID, Name: t.Name, Email: t.Email, Phone: t.Phone, Handle: t.Handle,
 				}, fmt.Sprintf("⚠️ Admin Escalation: Thursday %s is within %d days and still has ZERO bids. Manage at %s",
 					ev.date, resolveDays, s.baseURL))
 			}
@@ -1337,12 +1594,55 @@ func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string
 	return strings.Join(lines, "\n"), nil
 }
 
-// RequestOTP generates a 6-digit OTP for a registered teacher phone and sends it via Transport.
-func (s *Store) RequestOTP(ctx context.Context, phone string, now time.Time) (string, error) {
-	t, err := s.GetTeacherByPhone(ctx, phone)
+// RequestOTP generates a 6-digit OTP for an already-rostered teacher (by email
+// or phone) and dispatches it via the configured Transport.
+func (s *Store) RequestOTP(ctx context.Context, contact string, now time.Time) (string, error) {
+	t, err := s.GetTeacherByContact(ctx, contact)
 	if err != nil {
-		return "", errors.New("phone number not on the active instructor roster — ask admin to add you")
+		return "", errors.New("email not on the active instructor roster — use the group invite link to sign up, or ask an admin to add you")
 	}
+	target := t.Email
+	if !strings.Contains(contact, "@") || target == "" {
+		if strings.Contains(contact, "@") {
+			target = NormalizeEmail(contact)
+		} else {
+			target = t.Phone
+		}
+	}
+	return s.issueOTP(ctx, target, "", "", now)
+}
+
+// RequestSignupOTP validates an active invite token and dispatches a 6-digit
+// verification code to a prospective instructor's email address WITHOUT
+// inserting them into the roster yet. Their roster entry is created only once
+// VerifyOTP confirms email ownership.
+func (s *Store) RequestSignupOTP(ctx context.Context, email, name, phone, inviteToken string, now time.Time) (string, error) {
+	validEmail, err := ValidateEmail(email)
+	if err != nil {
+		return "", err
+	}
+	// If already on the active roster, send a normal login OTP right away.
+	if _, err := s.GetTeacherByEmail(ctx, validEmail); err == nil {
+		return s.issueOTP(ctx, validEmail, "", "", now)
+	}
+	if !s.ValidateInviteToken(ctx, inviteToken, now) {
+		return "", ErrInvalidInvite
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("your name is required to sign up")
+	}
+	normPhone := NormalizePhone(phone)
+	if normPhone != "" {
+		var existing int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE phone = ? AND active = 1`, normPhone).Scan(&existing); err == nil {
+			return "", errors.New("that phone number is already registered on the roster")
+		}
+	}
+	return s.issueOTP(ctx, validEmail, name, normPhone, now)
+}
+
+func (s *Store) issueOTP(ctx context.Context, target, pendingName, pendingPhone string, now time.Time) (string, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(900000))
 	if err != nil {
 		return "", err
@@ -1350,27 +1650,38 @@ func (s *Store) RequestOTP(ctx context.Context, phone string, now time.Time) (st
 	code := fmt.Sprintf("%06d", 100000+n.Int64())
 	exp := now.UTC().Add(10 * time.Minute).Format(time.RFC3339)
 
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM otp_codes WHERE phone = ?`, t.Phone)
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO otp_codes(phone, code, expires_at) VALUES (?, ?, ?)`,
-		t.Phone, code, exp); err != nil {
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO otp_codes(target, code, pending_name, pending_phone, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(target) DO UPDATE SET
+			code = excluded.code,
+			pending_name = excluded.pending_name,
+			pending_phone = excluded.pending_phone,
+			expires_at = excluded.expires_at
+	`, target, code, pendingName, pendingPhone, exp); err != nil {
 		return "", err
 	}
-	if err := s.hub.SendOTP(ctx, t.Phone, code); err != nil {
+	if err := s.hub.SendOTP(ctx, target, code); err != nil {
 		return "", err
 	}
 	return code, nil
 }
 
-// VerifyOTP checks a 6-digit code and returns a long-lived session token.
-func (s *Store) VerifyOTP(ctx context.Context, phone, code string, now time.Time) (string, *Teacher, error) {
-	t, err := s.GetTeacherByPhone(ctx, phone)
-	if err != nil {
-		return "", nil, errors.New("unknown teacher phone")
+// VerifyOTP checks a 6-digit code, completes deferred invite-signup if pending,
+// and returns a 90-day session token.
+func (s *Store) VerifyOTP(ctx context.Context, contact, code string, now time.Time) (string, *Teacher, error) {
+	target := NormalizePhone(contact)
+	if strings.Contains(contact, "@") {
+		target = NormalizeEmail(contact)
 	}
-	var savedCode, expStr string
-	err = s.db.QueryRowContext(ctx,
-		`SELECT code, expires_at FROM otp_codes WHERE phone = ?`, t.Phone).Scan(&savedCode, &expStr)
+	if target == "" {
+		return "", nil, errors.New("missing email")
+	}
+
+	var savedCode, pendingName, pendingPhone, expStr string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT code, pending_name, pending_phone, expires_at FROM otp_codes WHERE target = ?`, target,
+	).Scan(&savedCode, &pendingName, &pendingPhone, &expStr)
 	if err != nil {
 		return "", nil, errors.New("no active login code found — request a new code")
 	}
@@ -1381,7 +1692,29 @@ func (s *Store) VerifyOTP(ctx context.Context, phone, code string, now time.Time
 	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(code)), []byte(savedCode)) != 1 {
 		return "", nil, errors.New("invalid 6-digit code")
 	}
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM otp_codes WHERE phone = ?`, t.Phone)
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM otp_codes WHERE target = ?`, target)
+
+	t, err := s.GetTeacherByContact(ctx, target)
+	if err != nil {
+		if pendingName == "" {
+			return "", nil, errors.New("account not on active instructor roster")
+		}
+		t, err = s.SaveTeacher(ctx, pendingName, target, pendingPhone, "", false, now.UTC().Year())
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to create instructor profile: %w", err)
+		}
+		// Heads-up to admins so any unexpected invite-link signup is immediately visible.
+		if teachers, lerr := s.ListTeachers(ctx, now); lerr == nil {
+			for _, adm := range teachers {
+				if adm.IsAdmin {
+					_ = s.hub.SendDM(ctx, transport.Recipient{
+						TeacherID: adm.ID, Name: adm.Name, Email: adm.Email, Phone: adm.Phone, Handle: adm.Handle,
+					}, fmt.Sprintf("👋 %s (%s) verified their email and joined the Scrumpy's instructor roster via invite link. Manage roster: %s",
+						t.Name, t.Email, s.baseURL))
+				}
+			}
+		}
+	}
 
 	raw := make([]byte, 24)
 	if _, err := rand.Read(raw); err != nil {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log"
 	"net"
@@ -36,8 +37,8 @@ type Server struct {
 	mux   *http.ServeMux
 
 	rateMu sync.Mutex
-	otpReq map[string][]time.Time // request-otp hits, keyed "phone:.." / "ip:.."
-	otpVer map[string][]time.Time // verify-otp attempts, keyed "phone:.."
+	otpReq map[string][]time.Time // request-otp hits, keyed "target:.." / "ip:.."
+	otpVer map[string][]time.Time // verify-otp attempts, keyed "target:.."
 }
 
 func New(st *store.Store) *Server {
@@ -51,9 +52,10 @@ func New(st *store.Store) *Server {
 	return s
 }
 
-// ServeHTTP is the public perimeter: the bot webhook is localhost-only and
-// every /api route except the two login endpoints requires a session. Static
-// assets stay public so the login page renders for unauthenticated visitors.
+// ServeHTTP is the public perimeter: the bot webhook is localhost-only (and
+// rejected if forwarded through Cloudflare Tunnel), and every /api route
+// except the login endpoints requires a session. Static assets stay public so
+// the login/signup page renders for unauthenticated visitors.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/api/bot/inbound" {
 		if !isLocalRequest(r, ipIsLoopback) {
@@ -79,10 +81,21 @@ type ipPredicate func(net.IP) bool
 
 func ipIsLoopback(ip net.IP) bool { return ip.IsLoopback() }
 
-// isPrivateRequest reports whether the request originates from the local
-// machine or LAN (loopback or RFC1918) — used to keep manual-mode OTP codes
-// and other local conveniences off the public internet.
+// isCloudflareProxied detects traffic forwarded by cloudflared from the public
+// internet (which arrives at the origin over 127.0.0.1 carrying CF-Connecting-IP
+// and Cf-Ray headers). Such requests must never be treated as local/LAN.
+func isCloudflareProxied(r *http.Request) bool {
+	return strings.TrimSpace(r.Header.Get("CF-Connecting-IP")) != "" ||
+		strings.TrimSpace(r.Header.Get("Cf-Ray")) != ""
+}
+
+// isPrivateRequest reports whether the request originates directly from the
+// local machine or LAN (loopback or RFC1918, NOT via Cloudflare Tunnel) — used
+// to keep manual-mode OTP codes off the public internet.
 func isPrivateRequest(r *http.Request) bool {
+	if isCloudflareProxied(r) {
+		return false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -92,6 +105,9 @@ func isPrivateRequest(r *http.Request) bool {
 }
 
 func isLocalRequest(r *http.Request, pred ipPredicate) bool {
+	if isCloudflareProxied(r) {
+		return false
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
@@ -125,6 +141,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/auth/request-otp", s.handleRequestOTP)
 	s.mux.HandleFunc("POST /api/auth/verify-otp", s.handleVerifyOTP)
 	s.mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	s.mux.HandleFunc("POST /api/profile", s.handleUpdateProfile)
 
 	s.mux.HandleFunc("POST /api/bids", s.handlePlaceBid)
 	s.mux.HandleFunc("POST /api/bids/withdraw", s.handleWithdrawBid)
@@ -141,6 +158,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/admin/resolve", s.handleAdminResolve)
 	s.mux.HandleFunc("GET /api/admin/invite", s.handleAdminGetInvite)
 	s.mux.HandleFunc("POST /api/admin/invite/rotate", s.handleAdminRotateInvite)
+	s.mux.HandleFunc("POST /api/admin/invite/revoke", s.handleAdminRevokeInvite)
 
 	sub, _ := fs.Sub(staticFS, "static")
 	s.mux.Handle("/", http.FileServer(http.FS(sub)))
@@ -211,10 +229,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	digest, _ := s.store.GenerateWeeklyDigest(ctx, now)
 
 	var outbox []store.OutboxEntry
+	var inviteStatus *store.InviteStatus
 	inviteToken := ""
 	if isAdmin {
 		outbox, _ = s.store.ListOutbox(ctx, 50)
-		inviteToken, _ = s.store.GetInviteToken(ctx)
+		if st, err := s.store.GetInviteStatus(ctx, now); err == nil {
+			inviteStatus = &st
+			if st.Active {
+				inviteToken = st.Token
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -226,12 +250,25 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"transport_mode": s.store.Hub().Name(),
 		"digest":         digest,
 		"outbox":         outbox,
+		"invite":         inviteStatus,
 		"invite_token":   inviteToken,
 	})
 }
 
+func normalizeTargetKey(email, phone string) string {
+	if strings.TrimSpace(email) != "" {
+		return store.NormalizeEmail(email)
+	}
+	p := store.NormalizePhone(phone)
+	if p != "" {
+		return p
+	}
+	return strings.ToLower(strings.TrimSpace(phone))
+}
+
 func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		Email  string `json:"email"`
 		Phone  string `json:"phone"`
 		Name   string `json:"name,omitempty"`
 		Invite string `json:"invite,omitempty"`
@@ -240,9 +277,14 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	phone := strings.TrimSpace(req.Phone)
-	if !s.allow(s.otpReq, "phone:"+phone, otpRequestMaxPerPhone, otpWindow) {
-		writeErr(w, http.StatusTooManyRequests, "too many code requests for this number — try again in a few minutes")
+
+	contact := strings.TrimSpace(req.Email)
+	if contact == "" {
+		contact = strings.TrimSpace(req.Phone)
+	}
+	targetKey := normalizeTargetKey(req.Email, req.Phone)
+	if !s.allow(s.otpReq, "target:"+targetKey, otpRequestMaxPerPhone, otpWindow) {
+		writeErr(w, http.StatusTooManyRequests, "too many code requests — try again in a few minutes")
 		return
 	}
 	ipKey := "ip:" + clientIP(r)
@@ -250,43 +292,50 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "too many code requests from this network — try again later")
 		return
 	}
-	// Invite-gated self-signup: a number not on the roster may register itself
-	// (name + phone) only when it presents the current invite token from the
-	// group link. Everyone else gets the standard roster error.
-	if _, err := s.store.GetTeacherByPhone(r.Context(), phone); err != nil {
-		if !s.store.ValidateInviteToken(r.Context(), req.Invite) {
-			writeErr(w, http.StatusForbidden, "not on the instructor roster — use the invite link from the WhatsApp group, or ask an admin to add you")
+
+	now := time.Now().UTC()
+	var code string
+	var err error
+
+	if _, lookupErr := s.store.GetTeacherByContact(r.Context(), contact); lookupErr == nil {
+		code, err = s.store.RequestOTP(r.Context(), contact, now)
+	} else {
+		// Unregistered caller: permit self-signup ONLY with an active, non-expired
+		// invite token, and defer creating the roster row until VerifyOTP proves
+		// ownership of the email address.
+		signupEmail := req.Email
+		if signupEmail == "" && strings.Contains(req.Phone, "@") {
+			signupEmail = req.Phone
+		}
+		if strings.TrimSpace(signupEmail) == "" {
+			if !s.store.ValidateInviteToken(r.Context(), req.Invite, now) {
+				writeErr(w, http.StatusForbidden, "not on the instructor roster — use the invite link from the WhatsApp group, or ask an admin to add you")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, "email address is required to sign up")
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" {
-			writeErr(w, http.StatusBadRequest, "your name is required to sign up")
-			return
-		}
-		if _, err := s.store.CreateTeacher(r.Context(), req.Name, phone, "", false, time.Now().UTC().Year()); err != nil {
-			writeErr(w, http.StatusBadRequest, "signup failed: "+err.Error())
+		code, err = s.store.RequestSignupOTP(r.Context(), signupEmail, req.Name, req.Phone, req.Invite, now)
+		if errors.Is(err, store.ErrInvalidInvite) {
+			writeErr(w, http.StatusForbidden, err.Error())
 			return
 		}
 	}
-	code, err := s.store.RequestOTP(r.Context(), phone, time.Now().UTC())
+
 	if err != nil {
-		// Roster membership stays visible to the requester (helpful for
-		// onboarding) but the endpoint itself is rate-limited above.
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	resp := map[string]any{
 		"ok":             true,
 		"transport_mode": s.store.Hub().Name(),
 	}
-	// In manual mode (before the WhatsApp bot is linked), surface the OTP code
-	// directly in the response — but ONLY for local/LAN requests. Over the
-	// public internet the code goes to scheduler.log instead, so a stranger
-	// cannot mint their own session.
 	if s.store.Hub().Name() == "manual" {
 		if isPrivateRequest(r) {
 			resp["manual_mode_code"] = code
 		} else {
-			log.Printf("otp: manual-mode code for %s suppressed from response (non-local request), code=%s", phone, code)
+			log.Printf("otp: manual-mode code for %s suppressed from response (non-local request), code=%s", contact, code)
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -295,13 +344,19 @@ func (s *Server) handleRequestOTP(w http.ResponseWriter, r *http.Request) {
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if cfIP := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cfIP != "" {
+			return cfIP
+		}
 	}
 	return host
 }
 
 func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		Email string `json:"email"`
 		Phone string `json:"phone"`
 		Code  string `json:"code"`
 	}
@@ -309,13 +364,16 @@ func (s *Server) handleVerifyOTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	// Cap guessing: 10 attempts per number per 15 min against a 6-digit code
-	// valid for 10 minutes keeps brute-force odds negligible.
-	if !s.allow(s.otpVer, "phone:"+strings.TrimSpace(req.Phone), otpVerifyMaxPerPhone, otpWindow) {
+	contact := strings.TrimSpace(req.Email)
+	if contact == "" {
+		contact = strings.TrimSpace(req.Phone)
+	}
+	targetKey := normalizeTargetKey(req.Email, req.Phone)
+	if !s.allow(s.otpVer, "target:"+targetKey, otpVerifyMaxPerPhone, otpWindow) {
 		writeErr(w, http.StatusTooManyRequests, "too many attempts — request a new code in a few minutes")
 		return
 	}
-	tok, teacher, err := s.store.VerifyOTP(r.Context(), req.Phone, req.Code, time.Now().UTC())
+	tok, teacher, err := s.store.VerifyOTP(r.Context(), contact, req.Code, time.Now().UTC())
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, err.Error())
 		return
@@ -345,10 +403,37 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
+	viewer := s.currentTeacher(r)
+	if viewer == nil {
+		writeErr(w, http.StatusUnauthorized, "login required")
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Email string `json:"email"`
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		name = viewer.Name
+	}
+	t, err := s.store.SaveTeacher(r.Context(), name, req.Email, req.Phone, viewer.Handle, viewer.IsAdmin, time.Now().UTC().Year())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
 func (s *Server) handlePlaceBid(w http.ResponseWriter, r *http.Request) {
 	viewer := s.currentTeacher(r)
 	if viewer == nil {
-		writeErr(w, http.StatusUnauthorized, "please log in with your phone number first")
+		writeErr(w, http.StatusUnauthorized, "please log in first")
 		return
 	}
 	var req struct {
@@ -493,6 +578,7 @@ func (s *Server) handleAdminAddTeacher(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Name    string `json:"name"`
+		Email   string `json:"email"`
 		Phone   string `json:"phone"`
 		Handle  string `json:"handle"`
 		IsAdmin bool   `json:"is_admin"`
@@ -501,7 +587,7 @@ func (s *Server) handleAdminAddTeacher(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	t, err := s.store.CreateTeacher(r.Context(), req.Name, req.Phone, req.Handle, req.IsAdmin, time.Now().UTC().Year())
+	t, err := s.store.SaveTeacher(r.Context(), req.Name, req.Email, req.Phone, req.Handle, req.IsAdmin, time.Now().UTC().Year())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -568,24 +654,55 @@ func (s *Server) handleAdminGetInvite(w http.ResponseWriter, r *http.Request) {
 	if s.requireAdmin(w, r) == nil {
 		return
 	}
-	tok, err := s.store.GetInviteToken(r.Context())
+	st, err := s.store.GetInviteStatus(r.Context(), time.Now().UTC())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"invite_token": tok})
+	tok := ""
+	if st.Active {
+		tok = st.Token
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"invite_token": tok,
+		"expires_at":   st.ExpiresAt,
+		"active":       st.Active,
+	})
 }
 
 func (s *Server) handleAdminRotateInvite(w http.ResponseWriter, r *http.Request) {
 	if s.requireAdmin(w, r) == nil {
 		return
 	}
-	tok, err := s.store.RotateInviteToken(r.Context())
+	var req struct {
+		TTLDays int `json:"ttl_days"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	st, err := s.store.RotateInviteToken(r.Context(), time.Now().UTC(), req.TTLDays)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"invite_token": tok})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"invite_token": st.Token,
+		"expires_at":   st.ExpiresAt,
+		"active":       st.Active,
+	})
+}
+
+func (s *Server) handleAdminRevokeInvite(w http.ResponseWriter, r *http.Request) {
+	if s.requireAdmin(w, r) == nil {
+		return
+	}
+	if err := s.store.RevokeInviteToken(r.Context()); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"invite_token": "",
+		"expires_at":   "",
+		"active":       false,
+	})
 }
 
 func (s *Server) handleAdminResolve(w http.ResponseWriter, r *http.Request) {

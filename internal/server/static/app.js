@@ -9,12 +9,32 @@ let STATE = {
   outbox: [],
   selectedMonth: "all",
   openEditEventId: null,
-  invite: new URLSearchParams(location.search).get("invite") || "",
+  urlInvite: new URLSearchParams(location.search).get("invite") || "",
+  invite: null,
 };
 
-function setInviteUI(token) {
+function setInviteUI(inviteObj, fallbackToken) {
   const el = document.getElementById("adm-invite-url");
-  if (el && token) el.value = `${location.origin}/?invite=${token}`;
+  const statusEl = document.getElementById("adm-invite-status");
+  if (!el) return;
+  const active = inviteObj ? inviteObj.active : Boolean(fallbackToken);
+  const token = inviteObj ? inviteObj.token : fallbackToken;
+  const exp = inviteObj && inviteObj.expires_at ? new Date(inviteObj.expires_at) : null;
+  if (active && token) {
+    el.value = `${location.origin}/?invite=${token}`;
+    if (statusEl) {
+      statusEl.textContent = exp
+        ? `Active — expires ${exp.toLocaleString()}`
+        : "Active";
+    }
+  } else {
+    el.value = "";
+    if (statusEl) {
+      statusEl.textContent = exp
+        ? `Expired (${exp.toLocaleDateString()}) — click New Link to open self-signup.`
+        : "Self-signup closed (revoked) — click New Link to mint an expiring link.";
+    }
+  }
 }
 
 function showToast(msg) {
@@ -33,7 +53,9 @@ async function api(path, body) {
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}`);
+    const err = new Error(data.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -44,6 +66,11 @@ async function loadState() {
     Object.assign(STATE, data);
     renderAll();
   } catch (err) {
+    if (err.status === 401) {
+      STATE.viewer = null;
+      renderAuthBar();
+      return;
+    }
     showToast("Error loading state: " + err.message);
   }
 }
@@ -72,16 +99,27 @@ function renderAll() {
 function renderAuthBar() {
   const bar = document.getElementById("auth-bar");
   const loginCard = document.getElementById("login-card");
+  const navTabs = document.getElementById("nav-tabs");
   const adminTabBtn = document.getElementById("admin-tab-btn");
 
   if (!STATE.viewer) {
-    bar.innerHTML = `<span class="muted">Viewing as Guest — Sign in below to bid or volunteer</span>`;
+    bar.innerHTML = `<span class="muted">Sign in to view &amp; claim Thursdays</span>`;
     loginCard.classList.remove("hidden");
+    navTabs.classList.add("hidden");
+    ["schedule", "fairness", "digests", "admin"].forEach((t) => {
+      document.getElementById(`tab-${t}`).classList.add("hidden");
+    });
     adminTabBtn.classList.add("hidden");
     return;
   }
 
   loginCard.classList.add("hidden");
+  navTabs.classList.remove("hidden");
+  const activeBtn = document.querySelector("#nav-tabs .tab.active");
+  const activeTab = activeBtn ? activeBtn.dataset.tab : "schedule";
+  ["schedule", "fairness", "digests", "admin"].forEach((t) => {
+    document.getElementById(`tab-${t}`).classList.toggle("hidden", t !== activeTab);
+  });
   if (STATE.viewer.is_admin) {
     adminTabBtn.classList.remove("hidden");
   } else {
@@ -340,14 +378,16 @@ function renderDigests() {
 function renderAdmin() {
   if (!STATE.viewer || !STATE.viewer.is_admin) return;
   document.getElementById("transport-mode-label").textContent = STATE.transport_mode;
-  setInviteUI(STATE.invite_token);
+  setInviteUI(STATE.invite, STATE.invite_token);
 
   document.getElementById("admin-roster-list").innerHTML = STATE.teachers
     .map(
       (t) => `
       <div class="roster-row">
         <div>
-          <strong>${escapeHtml(t.name)}</strong> · <span class="muted">${escapeHtml(t.phone)}</span>
+          <strong>${escapeHtml(t.name)}</strong>
+          ${t.email ? ` · <span class="muted">${escapeHtml(t.email)}</span>` : ""}
+          ${t.phone ? ` · <span class="muted">${escapeHtml(t.phone)}</span>` : ""}
           ${t.is_admin ? `<span class="badge status-resolved">Admin</span>` : ""}
         </div>
         <div class="action-row">
@@ -365,6 +405,7 @@ function renderAdmin() {
     recruit_days_before: "Recruit Alert (days before)",
     tokens_per_year: "Veto Tokens / Year",
     months_open_ahead: "Months Open Ahead",
+    invite_ttl_days: "Invite Link Lifetime (days)",
   };
   document.getElementById("admin-config-fields").innerHTML = Object.entries(cfgLabels)
     .map(
@@ -528,36 +569,73 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   });
 
+  const applySignupMode = (open) => {
+    const fields = document.getElementById("signup-fields");
+    const heading = document.getElementById("login-heading");
+    const subtext = document.getElementById("login-subtext");
+    const toggle = document.getElementById("signup-toggle");
+    fields.classList.toggle("hidden", !open);
+    if (open) {
+      heading.textContent = "Join Scrumpy's Instructor Roster";
+      subtext.textContent =
+        "Enter your name and email below — we'll email a 6-digit verification code before adding you to the roster.";
+      toggle.textContent = "Already on the roster? Sign in instead";
+    } else {
+      heading.textContent = "Instructor Sign-In";
+      subtext.textContent = "Enter your email address to receive a 6-digit sign-in code.";
+      toggle.textContent = "Use group invite link";
+    }
+  };
+
+  if (STATE.urlInvite) {
+    document.getElementById("signup-invite").value = STATE.urlInvite;
+    applySignupMode(true);
+  }
+
   document.getElementById("btn-request-otp").onclick = async () => {
-    const phone = document.getElementById("login-phone").value.trim();
-    if (!phone) return showToast("Enter your phone number");
+    const contact = document.getElementById("login-email").value.trim();
+    if (!contact) return showToast("Enter your email address");
+    const isEmail = contact.includes("@");
     try {
       const res = await api("/api/auth/request-otp", {
-        phone,
+        email: isEmail ? contact : "",
+        phone: isEmail ? document.getElementById("signup-phone").value.trim() : contact,
         name: document.getElementById("signup-name").value.trim(),
-        invite: STATE.invite || document.getElementById("signup-invite").value.trim(),
+        invite: document.getElementById("signup-invite").value.trim() || STATE.urlInvite,
       });
-      document.getElementById("otp-step-phone").classList.add("hidden");
+      document.getElementById("otp-step-email").classList.add("hidden");
+      document.getElementById("signup-fields").classList.add("hidden");
+      document.getElementById("signup-toggle-row").classList.add("hidden");
       document.getElementById("otp-step-code").classList.remove("hidden");
       const hint = document.getElementById("otp-hint");
       if (res.manual_mode_code) {
-        hint.textContent = `Manual/Local Mode (WhatsApp bot not linked yet) — your code is: ${res.manual_mode_code}`;
+        hint.textContent = `Local Mode — your 6-digit code is: ${res.manual_mode_code}`;
         document.getElementById("login-code").value = res.manual_mode_code;
       } else {
-        hint.textContent = "Check your WhatsApp DMs for the 6-digit login code.";
+        hint.textContent = `Sent a 6-digit code to ${contact} — check your inbox (and spam folder).`;
       }
       hint.classList.remove("hidden");
+      document.getElementById("login-code").focus();
     } catch (err) {
       showToast(err.message);
     }
   };
 
   document.getElementById("btn-verify-otp").onclick = async () => {
-    const phone = document.getElementById("login-phone").value.trim();
+    const contact = document.getElementById("login-email").value.trim();
+    const isEmail = contact.includes("@");
     const code = document.getElementById("login-code").value.trim();
     try {
-      await api("/api/auth/verify-otp", { phone, code });
+      await api("/api/auth/verify-otp", {
+        email: isEmail ? contact : "",
+        phone: isEmail ? "" : contact,
+        code,
+      });
       document.getElementById("otp-hint").classList.add("hidden");
+      if (STATE.urlInvite) {
+        history.replaceState({}, "", location.pathname);
+        STATE.urlInvite = "";
+      }
       showToast("Signed in!");
       await loadState();
     } catch (err) {
@@ -567,23 +645,40 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btn-reset-otp").onclick = () => {
     document.getElementById("otp-step-code").classList.add("hidden");
-    document.getElementById("otp-step-phone").classList.remove("hidden");
+    document.getElementById("otp-step-email").classList.remove("hidden");
+    document.getElementById("signup-toggle-row").classList.remove("hidden");
+    if (STATE.urlInvite || document.getElementById("signup-name").value.trim()) {
+      applySignupMode(true);
+    }
   };
 
   document.getElementById("signup-toggle").onclick = (e) => {
     e.preventDefault();
-    document.getElementById("signup-fields").classList.toggle("hidden");
+    const currentlyHidden = document.getElementById("signup-fields").classList.contains("hidden");
+    applySignupMode(currentlyHidden);
   };
 
   document.getElementById("btn-copy-invite").onclick = () => {
-    copyText(document.getElementById("adm-invite-url").value);
+    const val = document.getElementById("adm-invite-url").value;
+    if (!val) return showToast("No active invite link — click New Link first.");
+    copyText(val);
   };
 
   document.getElementById("btn-rotate-invite").onclick = async () => {
     try {
       const res = await api("/api/admin/invite/rotate", {});
-      setInviteUI(res.invite_token);
-      showToast("Invite link rotated — old link is dead.");
+      setInviteUI({ token: res.invite_token, expires_at: res.expires_at, active: res.active });
+      showToast("Minted new expiring invite link — previous link is dead.");
+    } catch (err) {
+      showToast(err.message);
+    }
+  };
+
+  document.getElementById("btn-revoke-invite").onclick = async () => {
+    try {
+      await api("/api/admin/invite/revoke", {});
+      setInviteUI({ token: "", expires_at: "", active: false });
+      showToast("Invite link revoked — self-signup is now closed.");
     } catch (err) {
       showToast(err.message);
     }
@@ -598,8 +693,8 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       await api("/api/admin/teachers", {
         name: document.getElementById("adm-name").value,
+        email: document.getElementById("adm-email").value,
         phone: document.getElementById("adm-phone").value,
-        handle: document.getElementById("adm-handle").value,
         is_admin: document.getElementById("adm-is-admin").checked,
       });
       e.target.reset();

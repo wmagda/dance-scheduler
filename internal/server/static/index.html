@@ -30,22 +30,23 @@
 
     <!-- Login Banner when unauthenticated -->
     <section id="login-card" class="card login-card hidden">
-      <h2>Instructor Sign-In (Phone OTP)</h2>
-      <p class="muted">Enter your phone number from the WhatsApp instructor group. We'll send a 6-digit login code.</p>
-      <div class="login-row" id="otp-step-phone">
-        <input type="tel" id="login-phone" placeholder="+1 (970) 555-0100" />
-        <button class="btn primary" id="btn-request-otp">Send 6-Digit Code</button>
+      <h2 id="login-heading">Instructor Sign-In</h2>
+      <p class="muted" id="login-subtext">Enter your email address to receive a 6-digit sign-in code.</p>
+      <div class="login-row hidden" id="signup-fields">
+        <input type="text" id="signup-name" placeholder="Your full name" autocomplete="name" />
+        <input type="tel" id="signup-phone" placeholder="Phone (optional)" autocomplete="tel" />
+        <input type="text" id="signup-invite" placeholder="Invite code" />
+      </div>
+      <div class="login-row" id="otp-step-email">
+        <input type="text" id="login-email" placeholder="you@example.com" autocomplete="email" />
+        <button class="btn primary" id="btn-request-otp">Email 6-Digit Code</button>
       </div>
       <div class="login-row hidden" id="otp-step-code">
-        <input type="text" id="login-code" placeholder="6-digit code" maxlength="6" />
+        <input type="text" id="login-code" placeholder="6-digit code" maxlength="6" inputmode="numeric" autocomplete="one-time-code" />
         <button class="btn primary" id="btn-verify-otp">Verify &amp; Sign In</button>
         <button class="btn ghost" id="btn-reset-otp">Back</button>
       </div>
-      <div class="login-row hidden" id="signup-fields">
-        <input type="text" id="signup-name" placeholder="Your name" />
-        <input type="text" id="signup-invite" placeholder="Invite code" />
-      </div>
-      <p class="muted" id="signup-toggle-row">New instructor? <a href="#" id="signup-toggle">Sign up here</a> (invite link from the WhatsApp group)</p>
+      <p class="muted" id="signup-toggle-row">New instructor? <a href="#" id="signup-toggle">Use group invite link</a></p>
       <p id="otp-hint" class="otp-hint hidden"></p>
     </section>
 
@@ -105,10 +106,10 @@
           <form id="form-add-teacher" class="stack-form">
             <div class="form-row">
               <input type="text" id="adm-name" placeholder="Instructor Name" required />
-              <input type="tel" id="adm-phone" placeholder="Phone (+1970...)" required />
+              <input type="email" id="adm-email" placeholder="Email (you@example.com)" required />
             </div>
             <div class="form-row">
-              <input type="text" id="adm-handle" placeholder="Telegram @handle (optional)" />
+              <input type="tel" id="adm-phone" placeholder="Phone (optional)" />
               <label class="checkbox-label">
                 <input type="checkbox" id="adm-is-admin" /> Admin
               </label>
@@ -121,12 +122,14 @@
 
         <div class="card">
           <h2>Invite Link (Self-Signup)</h2>
+          <p class="muted" id="adm-invite-status"></p>
           <div class="login-row">
-            <input type="text" id="adm-invite-url" readonly />
+            <input type="text" id="adm-invite-url" readonly placeholder="No active invite link" />
             <button class="btn small" id="btn-copy-invite">Copy</button>
-            <button class="btn small gold" id="btn-rotate-invite">Rotate</button>
+            <button class="btn small gold" id="btn-rotate-invite">New Link</button>
+            <button class="btn small" id="btn-revoke-invite">Revoke</button>
           </div>
-          <p class="muted">Share this in the WhatsApp group — new instructors sign up with name + phone. Rotating kills the old link instantly.</p>
+          <p class="muted">Share in the instructors group — new teachers enter name + email and are added only after verifying their 6-digit email code. Links auto-expire.</p>
           <h2>Scheduler Parameters &amp; Resolver</h2>
           <div class="card-head">
             <button class="btn primary small" id="btn-run-resolver">Run Resolver &amp; Recruitment Sweep Now</button>

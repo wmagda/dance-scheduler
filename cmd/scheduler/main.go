@@ -12,6 +12,7 @@ import (
 
 	"github.com/wojtek/dance-scheduler/internal/server"
 	"github.com/wojtek/dance-scheduler/internal/store"
+	"github.com/wojtek/dance-scheduler/internal/transport"
 )
 
 func envOr(key, fallback string) string {
@@ -26,8 +27,11 @@ func main() {
 		port          = flag.String("port", envOr("PORT", "8095"), "HTTP listen port")
 		dbPath        = flag.String("db", envOr("DB_PATH", "./dance.db"), "SQLite database path")
 		baseURL       = flag.String("base-url", envOr("APP_BASE_URL", "http://localhost:8095"), "Public base URL for links")
-		transportMode = flag.String("transport", envOr("TRANSPORT_MODE", "manual"), "Transport mode: manual, whatsapp, telegram")
+		transportMode = flag.String("transport", envOr("TRANSPORT_MODE", "manual"), "Transport mode: manual, email, whatsapp, telegram")
 		webhookURL    = flag.String("webhook-url", envOr("BOT_WEBHOOK_URL", ""), "Optional bot bridge webhook URL")
+		resendKey     = flag.String("resend-key", envOr("RESEND_API_KEY", ""), "Resend API key when transport=email")
+		emailFrom     = flag.String("email-from", envOr("EMAIL_FROM", "Scrumpy's Latin Dancing <noreply@scrumpys.codeciech.com>"), "Sender header for outbound emails")
+		adminEmail    = flag.String("admin-email", envOr("ADMIN_BOOTSTRAP_EMAIL", ""), "Bootstrap admin email address")
 		adminPhone    = flag.String("admin-phone", envOr("ADMIN_BOOTSTRAP_PHONE", ""), "Bootstrap admin phone number")
 		adminName     = flag.String("admin-name", envOr("ADMIN_BOOTSTRAP_NAME", "Admin"), "Bootstrap admin name")
 		resolveOnce   = flag.Bool("resolve-once", false, "Run due resolutions + recruitment sweep once and exit")
@@ -37,7 +41,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(*dbPath, *baseURL, *transportMode, *webhookURL)
+	st, err := store.OpenWithEmail(*dbPath, *baseURL, *transportMode, *webhookURL, transport.EmailConfig{
+		APIKey: *resendKey,
+		From:   *emailFrom,
+	})
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
@@ -47,8 +54,8 @@ func main() {
 	if err := st.EnsureUpcomingThursdays(ctx, now); err != nil {
 		log.Fatalf("ensure upcoming Thursdays: %v", err)
 	}
-	if *adminPhone != "" && *adminName != "" {
-		if _, err := st.CreateTeacher(ctx, *adminName, *adminPhone, "", true, now.Year()); err != nil {
+	if (*adminEmail != "" || *adminPhone != "") && *adminName != "" {
+		if _, err := st.SaveTeacher(ctx, *adminName, *adminEmail, *adminPhone, "", true, now.Year()); err != nil {
 			log.Printf("warn: bootstrap admin: %v", err)
 		}
 	}

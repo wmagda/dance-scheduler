@@ -280,13 +280,14 @@ func TestVerifyOTPAttemptCap(t *testing.T) {
 	}
 }
 
-// Invite-gated self-signup: a non-roster phone can register only with the
-// current invite token, obtained via the admin invite endpoints.
+// Invite-gated self-signup: a non-roster email can register only with an
+// active invite token, is added to the roster only AFTER verifying the 6-digit
+// code, and is blocked once the invite link is revoked.
 func TestInviteSignupFlow(t *testing.T) {
 	srv := newTestServer(t)
 
-	// 1. Unknown phone without invite -> forbidden.
-	body, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person"})
+	// 1. Unknown email without invite -> forbidden.
+	body, _ := json.Marshal(map[string]string{"email": "newteacher@example.com", "name": "New Person"})
 	resp, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("request-otp: %v", err)
@@ -296,7 +297,7 @@ func TestInviteSignupFlow(t *testing.T) {
 		t.Fatalf("no-invite signup: want 403, got %d", resp.StatusCode)
 	}
 
-	// 2. Login as admin and fetch the invite token.
+	// 2. Login as admin and fetch the invite token + expiration metadata.
 	cookie := loginSession(t, srv.URL)
 	req, _ := http.NewRequest("GET", srv.URL+"/api/admin/invite", nil)
 	req.AddCookie(cookie)
@@ -310,14 +311,16 @@ func TestInviteSignupFlow(t *testing.T) {
 	}
 	var inv struct {
 		InviteToken string `json:"invite_token"`
+		ExpiresAt   string `json:"expires_at"`
+		Active      bool   `json:"active"`
 	}
 	_ = json.NewDecoder(resp2.Body).Decode(&inv)
-	if len(inv.InviteToken) < 16 {
-		t.Fatalf("expected invite token, got %q", inv.InviteToken)
+	if !inv.Active || len(inv.InviteToken) < 16 || inv.ExpiresAt == "" {
+		t.Fatalf("expected active expiring invite token, got %+v", inv)
 	}
 
 	// 3. Bad token still rejected.
-	bodyBad, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person", "invite": "deadbeefdeadbeef"})
+	bodyBad, _ := json.Marshal(map[string]string{"email": "newteacher@example.com", "name": "New Person", "invite": "deadbeefdeadbeef"})
 	resp3, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(bodyBad))
 	if err != nil {
 		t.Fatalf("request-otp bad invite: %v", err)
@@ -327,8 +330,8 @@ func TestInviteSignupFlow(t *testing.T) {
 		t.Fatalf("bad-invite signup: want 403, got %d", resp3.StatusCode)
 	}
 
-	// 4. Valid token + name -> signup succeeds and login works end-to-end.
-	bodyOK, _ := json.Marshal(map[string]string{"phone": "9705550199", "name": "New Person", "invite": inv.InviteToken})
+	// 4. Valid token + name + email -> code issued, verify creates roster account & session.
+	bodyOK, _ := json.Marshal(map[string]string{"email": "newteacher@example.com", "name": "New Person", "invite": inv.InviteToken})
 	resp4, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(bodyOK))
 	if err != nil {
 		t.Fatalf("request-otp signup: %v", err)
@@ -341,10 +344,69 @@ func TestInviteSignupFlow(t *testing.T) {
 	if resp4.StatusCode != 200 || len(otpResp.ManualModeCode) != 6 {
 		t.Fatalf("invite signup: want 200+code, got %d code=%q", resp4.StatusCode, otpResp.ManualModeCode)
 	}
-	verBody, _ := json.Marshal(map[string]string{"phone": "9705550199", "code": otpResp.ManualModeCode})
+	verBody, _ := json.Marshal(map[string]string{"email": "newteacher@example.com", "code": otpResp.ManualModeCode})
 	resp5, err := http.Post(srv.URL+"/api/auth/verify-otp", "application/json", bytes.NewReader(verBody))
 	if err != nil || resp5.StatusCode != 200 {
 		t.Fatalf("verify-otp after signup: status=%v err=%v", resp5.StatusCode, err)
 	}
 	resp5.Body.Close()
+
+	// 5. Revoke invite link -> subsequent signups rejected with 403.
+	reqRev, _ := http.NewRequest("POST", srv.URL+"/api/admin/invite/revoke", bytes.NewReader([]byte("{}")))
+	reqRev.AddCookie(cookie)
+	respRev, err := http.DefaultClient.Do(reqRev)
+	if err != nil || respRev.StatusCode != 200 {
+		t.Fatalf("revoke invite: status=%v err=%v", respRev.StatusCode, err)
+	}
+	respRev.Body.Close()
+
+	bodyAfterRev, _ := json.Marshal(map[string]string{"email": "another@example.com", "name": "Another", "invite": inv.InviteToken})
+	resp6, err := http.Post(srv.URL+"/api/auth/request-otp", "application/json", bytes.NewReader(bodyAfterRev))
+	if err != nil {
+		t.Fatalf("request-otp after revoke: %v", err)
+	}
+	resp6.Body.Close()
+	if resp6.StatusCode != http.StatusForbidden {
+		t.Fatalf("signup after revoke: want 403, got %d", resp6.StatusCode)
+	}
+}
+
+// cloudflared forwards public internet traffic over 127.0.0.1 with CF-Connecting-IP;
+// ensure such requests never pass loopback/LAN checks.
+func TestCloudflareTunnelLoopbackProtection(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "cf.db"), "https://scrumpys.codeciech.com", "manual", "")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	_ = st.EnsureUpcomingThursdays(context.Background(), time.Now().UTC())
+	if _, err := st.SaveTeacher(context.Background(), "Admin", "admin@codeciech.com", "+19705550100", "", true, 2026); err != nil {
+		t.Fatalf("SaveTeacher: %v", err)
+	}
+	s := New(st)
+
+	// 1. /api/bot/inbound via cloudflared (127.0.0.1 + CF-Connecting-IP) must 403.
+	reqBot := httptest.NewRequest("POST", "/api/bot/inbound", bytes.NewReader([]byte(`{"phone":"+19705550100","text":"/status"}`)))
+	reqBot.RemoteAddr = "127.0.0.1:52000"
+	reqBot.Header.Set("CF-Connecting-IP", "198.51.100.77")
+	recBot := httptest.NewRecorder()
+	s.ServeHTTP(recBot, reqBot)
+	if recBot.Code != http.StatusForbidden {
+		t.Fatalf("cloudflared bot webhook: want 403, got %d", recBot.Code)
+	}
+
+	// 2. Manual-mode OTP via cloudflared must NOT leak manual_mode_code.
+	reqOTP := httptest.NewRequest("POST", "/api/auth/request-otp", bytes.NewReader([]byte(`{"email":"admin@codeciech.com"}`)))
+	reqOTP.RemoteAddr = "127.0.0.1:52001"
+	reqOTP.Header.Set("CF-Connecting-IP", "198.51.100.77")
+	recOTP := httptest.NewRecorder()
+	s.ServeHTTP(recOTP, reqOTP)
+	if recOTP.Code != http.StatusOK {
+		t.Fatalf("cloudflared request-otp: want 200, got %d (%s)", recOTP.Code, recOTP.Body.String())
+	}
+	var otpBody map[string]any
+	_ = json.Unmarshal(recOTP.Body.Bytes(), &otpBody)
+	if _, leaked := otpBody["manual_mode_code"]; leaked {
+		t.Fatalf("manual_mode_code leaked over cloudflared loopback proxy: %v", otpBody)
+	}
 }

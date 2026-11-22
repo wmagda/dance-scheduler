@@ -1,5 +1,5 @@
 // Package transport defines the messaging abstraction layer so the core
-// scheduler never couples directly to WhatsApp, Telegram, or manual copy-paste.
+// scheduler never couples directly to Email (Resend), WhatsApp, Telegram, or manual copy-paste.
 package transport
 
 import (
@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -26,8 +27,16 @@ const (
 type Recipient struct {
 	TeacherID int64  `json:"teacher_id"`
 	Name      string `json:"name"`
-	Phone     string `json:"phone"`
+	Email     string `json:"email,omitempty"`
+	Phone     string `json:"phone,omitempty"`
 	Handle    string `json:"handle,omitempty"`
+}
+
+// EmailConfig configures transactional email delivery via the Resend HTTP API.
+type EmailConfig struct {
+	APIKey  string // Resend API key (re_...)
+	From    string // e.g. "Scrumpy's Latin Dancing <noreply@scrumpys.codeciech.com>"
+	BaseURL string // Optional override for testing (defaults to https://api.resend.com)
 }
 
 // CommandType is a parsed inbound bot slash-command.
@@ -50,12 +59,12 @@ type Command struct {
 }
 
 // Transport is the messaging interface consumed by the scheduler and web server.
-// Swapping WhatsApp, Telegram, or Manual Digest is a configuration change.
+// Swapping Email (Resend), WhatsApp, Telegram, or Manual Digest is a configuration change.
 type Transport interface {
 	Name() string
 	SendDM(ctx context.Context, to Recipient, text string) error
 	PostToGroup(ctx context.Context, text string) error
-	SendOTP(ctx context.Context, phone string, code string) error
+	SendOTP(ctx context.Context, target string, code string) error
 	ParseCommand(raw string) (*Command, error)
 }
 
@@ -63,25 +72,38 @@ type Transport interface {
 // UI always has a copy-paste digest and audit trail even if a bot is offline.
 type RecordFunc func(ctx context.Context, ch Channel, recipient string, body string) error
 
-// Hub implements Transport by recording every message into the persistent
-// outbox (Level 1 manual digest fallback) and optionally forwarding to an
-// external bot webhook (WhatsApp Web / Baileys or Telegram Bot bridge).
+// Hub implements Transport by recording outbound messages into the persistent
+// outbox and delivering via Resend Email (when mode == "email") or an optional
+// chat bot webhook (WhatsApp / Telegram).
 type Hub struct {
 	mode       string
 	webhookURL string
+	emailCfg   EmailConfig
 	record     RecordFunc
 	client     *http.Client
 }
 
-// NewHub constructs a transport Hub.
-// mode may be "manual", "whatsapp", or "telegram".
+// NewHub constructs a transport Hub without email credentials.
+// mode may be "manual", "email", "whatsapp", or "telegram".
 func NewHub(mode, webhookURL string, record RecordFunc) *Hub {
+	return NewHubWithEmail(mode, webhookURL, EmailConfig{}, record)
+}
+
+// NewHubWithEmail constructs a transport Hub with optional Resend EmailConfig.
+func NewHubWithEmail(mode, webhookURL string, emailCfg EmailConfig, record RecordFunc) *Hub {
 	if mode == "" {
 		mode = "manual"
+	}
+	if strings.TrimSpace(emailCfg.From) == "" {
+		emailCfg.From = "Scrumpy's Latin Dancing <noreply@scrumpys.codeciech.com>"
+	}
+	if strings.TrimSpace(emailCfg.BaseURL) == "" {
+		emailCfg.BaseURL = "https://api.resend.com"
 	}
 	return &Hub{
 		mode:       mode,
 		webhookURL: strings.TrimSpace(webhookURL),
+		emailCfg:   emailCfg,
 		record:     record,
 		client:     &http.Client{Timeout: 10 * time.Second},
 	}
@@ -90,15 +112,27 @@ func NewHub(mode, webhookURL string, record RecordFunc) *Hub {
 func (h *Hub) Name() string { return h.mode }
 
 func (h *Hub) SendDM(ctx context.Context, to Recipient, text string) error {
-	addr := to.Phone
+	addr := to.Email
+	if addr == "" {
+		addr = to.Phone
+	}
 	if h.mode == "telegram" && to.Handle != "" {
 		addr = to.Handle
 	}
-	label := fmt.Sprintf("%s (%s)", to.Name, addr)
+	label := to.Name
+	if addr != "" {
+		label = fmt.Sprintf("%s (%s)", to.Name, addr)
+	}
 	if h.record != nil {
 		if err := h.record(ctx, ChannelDM, label, text); err != nil {
 			return err
 		}
+	}
+	if h.mode == "email" && strings.TrimSpace(to.Email) != "" && strings.TrimSpace(h.emailCfg.APIKey) != "" {
+		// Best-effort DM email: outbox already captured the notification, so don't
+		// abort state transitions if an instructor's mailbox bounces.
+		_ = h.sendResendEmail(ctx, to.Email, "Thursday Latin Dancing @ Scrumpy's — Schedule Update", text)
+		return nil
 	}
 	return h.forwardWebhook(ctx, map[string]any{
 		"channel":   "dm",
@@ -121,24 +155,63 @@ func (h *Hub) PostToGroup(ctx context.Context, text string) error {
 	})
 }
 
-func (h *Hub) SendOTP(ctx context.Context, phone string, code string) error {
-	msg := fmt.Sprintf("Your Thursday Latin Dancing login code is: %s (expires in 10 minutes).", code)
+func (h *Hub) SendOTP(ctx context.Context, target string, code string) error {
+	msg := fmt.Sprintf("Your Thursday Latin Dancing at Scrumpy's login code is: %s\n\nThis code expires in 10 minutes.", code)
 	if h.record != nil {
-		if err := h.record(ctx, ChannelOTP, phone, msg); err != nil {
+		// Record audit entry without storing live plaintext OTP codes in the UI outbox.
+		if err := h.record(ctx, ChannelOTP, target, "6-digit login code dispatched (expires in 10m)"); err != nil {
 			return err
 		}
+	}
+	if h.mode == "email" {
+		if strings.TrimSpace(h.emailCfg.APIKey) == "" {
+			return fmt.Errorf("email transport selected but RESEND_API_KEY is not configured")
+		}
+		subj := fmt.Sprintf("Your Scrumpy's Scheduler code: %s", code)
+		return h.sendResendEmail(ctx, target, subj, msg)
 	}
 	return h.forwardWebhook(ctx, map[string]any{
 		"channel":   "otp",
 		"transport": h.mode,
-		"phone":     phone,
+		"phone":     target,
+		"email":     target,
 		"code":      code,
 		"text":      msg,
 	})
 }
 
+func (h *Hub) sendResendEmail(ctx context.Context, toEmail, subject, textBody string) error {
+	payload := map[string]any{
+		"from":    h.emailCfg.From,
+		"to":      []string{strings.TrimSpace(toEmail)},
+		"subject": subject,
+		"text":    textBody,
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := strings.TrimRight(h.emailCfg.BaseURL, "/") + "/emails"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(h.emailCfg.APIKey))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("resend request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("resend error (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 func (h *Hub) forwardWebhook(ctx context.Context, payload map[string]any) error {
-	if h.webhookURL == "" || h.mode == "manual" {
+	if h.webhookURL == "" || h.mode == "manual" || h.mode == "email" {
 		return nil
 	}
 	b, err := json.Marshal(payload)
