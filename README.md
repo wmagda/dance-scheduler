@@ -2,8 +2,6 @@
 
 Fairness-based Thursday instructor & DJ scheduling web app + messaging bot engine for Scrumpy's Latin Dancing (~2 dozen instructors).
 
-Canonical design specification in Obsidian vault: `Dance Instructor Scheduler - Design Plan.md`.
-
 ## Key Features (Phase 1 Core + Transport Abstraction)
 
 - **Rolling 6-Month Thursday Calendar**: Automatically opens Thursdays `months_open_ahead` (default 6) months in advance without spamming the group channel.
@@ -32,5 +30,3 @@ make test
 make build
 ./dance-scheduler -port 8095 -db ./dance.db
 ```
-
-Copy this README to the Obsidian vault if desired, or view the design doc at `/home/wojtek/Obsidian Vault/Dance Instructor Scheduler - Design Plan.md`.

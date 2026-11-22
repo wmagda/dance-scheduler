@@ -29,7 +29,7 @@ func main() {
 		transportMode = flag.String("transport", envOr("TRANSPORT_MODE", "manual"), "Transport mode: manual, whatsapp, telegram")
 		webhookURL    = flag.String("webhook-url", envOr("BOT_WEBHOOK_URL", ""), "Optional bot bridge webhook URL")
 		adminPhone    = flag.String("admin-phone", envOr("ADMIN_BOOTSTRAP_PHONE", ""), "Bootstrap admin phone number")
-		adminName     = flag.String("admin-name", envOr("ADMIN_BOOTSTRAP_NAME", "Wojtek"), "Bootstrap admin name")
+		adminName     = flag.String("admin-name", envOr("ADMIN_BOOTSTRAP_NAME", "Admin"), "Bootstrap admin name")
 		resolveOnce   = flag.Bool("resolve-once", false, "Run due resolutions + recruitment sweep once and exit")
 	)
 	flag.Parse()
