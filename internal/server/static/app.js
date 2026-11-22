@@ -350,6 +350,27 @@ function renderFairness() {
         )
         .join("")
     : `<p class="muted">No Veto Tokens used yet this year.</p>`;
+
+  const publicRules = [
+    { label: "Fairness Window", val: `${STATE.config.fairness_window_days || "90"} days rolling` },
+    { label: "Bids Lock & Resolve", val: `T-${STATE.config.resolve_days_before || "7"} days before` },
+    { label: "Open-Date Recruit Nudge", val: `T-${STATE.config.recruit_days_before || "14"} days before` },
+    { label: "Veto Tokens Granted", val: `${STATE.config.tokens_per_year || "2"} / calendar year` },
+    { label: "Schedule Horizon", val: `${STATE.config.months_open_ahead || "6"} months ahead` },
+  ];
+  const pubEl = document.getElementById("public-config-list");
+  if (pubEl) {
+    pubEl.innerHTML = publicRules
+      .map(
+        (r) => `
+        <div class="config-stat">
+          <span class="config-stat-label">${escapeHtml(r.label)}</span>
+          <strong class="config-stat-val">${escapeHtml(r.val)}</strong>
+        </div>
+      `
+      )
+      .join("");
+  }
 }
 
 function renderDigests() {
