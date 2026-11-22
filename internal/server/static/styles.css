@@ -41,8 +41,12 @@ body {
   gap: 0.85rem;
 }
 
-.brand-icon {
-  font-size: 2rem;
+.brand-logo {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 0.6rem;
+  flex-shrink: 0;
+  display: block;
 }
 
 .brand h1 {
