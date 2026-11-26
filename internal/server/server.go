@@ -161,8 +161,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/admin/invite/rotate", s.handleAdminRotateInvite)
 	s.mux.HandleFunc("POST /api/admin/invite/revoke", s.handleAdminRevokeInvite)
 
-	sub, _ := fs.Sub(staticFS, "static")
-	s.mux.Handle("/", http.FileServer(http.FS(sub)))
+  sub, _ := fs.Sub(staticFS, "static")
+	fileSrv := http.FileServer(http.FS(sub))
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || strings.HasSuffix(r.URL.Path, ".html") || strings.HasSuffix(r.URL.Path, ".js") || strings.HasSuffix(r.URL.Path, ".css") {
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		}
+		fileSrv.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) currentTeacher(r *http.Request) *store.Teacher {
