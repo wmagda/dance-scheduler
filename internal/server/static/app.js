@@ -1,6 +1,7 @@
 let STATE = {
   viewer: null,
   events: [],
+  past_events: [],
   teachers: [],
   tokens_used: [],
   config: {},
@@ -8,6 +9,7 @@ let STATE = {
   digest: "",
   outbox: [],
   selectedMonth: "all",
+  historyRange: "90d",
   openEditEventId: null,
   urlInvite: new URLSearchParams(location.search).get("invite") || "",
   invite: null,
@@ -92,6 +94,7 @@ function renderAll() {
   renderMonthFilters();
   renderEvents();
   renderFairness();
+  renderHistory();
   renderDigests();
   renderAdmin();
 }
@@ -106,7 +109,7 @@ function renderAuthBar() {
     bar.innerHTML = `<span class="muted">Sign in to view &amp; claim Thursdays</span>`;
     loginCard.classList.remove("hidden");
     navTabs.classList.add("hidden");
-    ["schedule", "fairness", "digests", "admin"].forEach((t) => {
+    ["schedule", "fairness", "history", "digests", "admin"].forEach((t) => {
       document.getElementById(`tab-${t}`).classList.add("hidden");
     });
     adminTabBtn.classList.add("hidden");
@@ -117,7 +120,7 @@ function renderAuthBar() {
   navTabs.classList.remove("hidden");
   const activeBtn = document.querySelector("#nav-tabs .tab.active");
   const activeTab = activeBtn ? activeBtn.dataset.tab : "schedule";
-  ["schedule", "fairness", "digests", "admin"].forEach((t) => {
+  ["schedule", "fairness", "history", "digests", "admin"].forEach((t) => {
     document.getElementById(`tab-${t}`).classList.toggle("hidden", t !== activeTab);
   });
   if (STATE.viewer.is_admin) {
@@ -386,6 +389,182 @@ function renderFairness() {
   }
 }
 
+function renderHistory() {
+  const filterEl = document.getElementById("history-filters");
+  if (!filterEl) return;
+
+  const currentYear = String(new Date().getFullYear());
+  const ranges = [
+    { key: "30d", label: "Last 30 Days" },
+    { key: "90d", label: "Last 90 Days" },
+    { key: "180d", label: "Last 6 Months" },
+    { key: "365d", label: "Last Year" },
+    { key: "ytd", label: `This Year (${currentYear})` },
+    { key: "all", label: "All Time" },
+  ];
+
+  filterEl.innerHTML = ranges
+    .map(
+      (r) =>
+        `<button class="btn small ${STATE.historyRange === r.key ? "primary" : ""}" data-range="${r.key}">${escapeHtml(r.label)}</button>`
+    )
+    .join("");
+  filterEl.querySelectorAll("button").forEach((btn) => {
+    btn.onclick = () => {
+      STATE.historyRange = btn.dataset.range;
+      renderHistory();
+    };
+  });
+
+  const now = new Date();
+  let cutoffYMD = "0000-01-01";
+  let rangeLabel = "All Time";
+  const foundRange = ranges.find((r) => r.key === STATE.historyRange);
+  if (foundRange) rangeLabel = foundRange.label;
+
+  if (STATE.historyRange === "30d") {
+    cutoffYMD = new Date(now.getTime() - 30 * 86400000).toISOString().slice(0, 10);
+  } else if (STATE.historyRange === "90d") {
+    cutoffYMD = new Date(now.getTime() - 90 * 86400000).toISOString().slice(0, 10);
+  } else if (STATE.historyRange === "180d") {
+    cutoffYMD = new Date(now.getTime() - 180 * 86400000).toISOString().slice(0, 10);
+  } else if (STATE.historyRange === "365d") {
+    cutoffYMD = new Date(now.getTime() - 365 * 86400000).toISOString().slice(0, 10);
+  } else if (STATE.historyRange === "ytd") {
+    cutoffYMD = `${currentYear}-01-01`;
+  }
+
+  const pastInWindow = (STATE.past_events || []).filter((e) => e.date >= cutoffYMD);
+
+  // Aggregate stats per teacher
+  const statsMap = new Map();
+  for (const t of STATE.teachers || []) {
+    statsMap.set(t.id, {
+      id: t.id,
+      name: t.name,
+      taught: 0,
+      dibsUsed: 0,
+      volunteered: 0,
+      lastTaught: "",
+      styles: {},
+    });
+  }
+
+  for (const ev of pastInWindow) {
+    if ((ev.status === "resolved" || ev.status === "done") && ev.winner_teacher_id) {
+      if (!statsMap.has(ev.winner_teacher_id)) {
+        statsMap.set(ev.winner_teacher_id, {
+          id: ev.winner_teacher_id,
+          name: ev.winner_name || "Instructor",
+          taught: 0,
+          dibsUsed: 0,
+          volunteered: 0,
+          lastTaught: "",
+          styles: {},
+        });
+      }
+      const st = statsMap.get(ev.winner_teacher_id);
+      st.taught += 1;
+      if (ev.resolved_via === "token") st.dibsUsed += 1;
+      if (!st.lastTaught || ev.date > st.lastTaught) st.lastTaught = ev.date;
+      const styleKey = (ev.lesson_type || "salsa").toUpperCase();
+      st.styles[styleKey] = (st.styles[styleKey] || 0) + 1;
+    }
+    for (const v of ev.volunteers || []) {
+      if (!statsMap.has(v.teacher_id)) {
+        statsMap.set(v.teacher_id, {
+          id: v.teacher_id,
+          name: v.name || "Instructor",
+          taught: 0,
+          dibsUsed: 0,
+          volunteered: 0,
+          lastTaught: "",
+          styles: {},
+        });
+      }
+      statsMap.get(v.teacher_id).volunteered += 1;
+    }
+  }
+
+  const rows = Array.from(statsMap.values()).sort(
+    (a, b) => b.taught - a.taught || b.volunteered - a.volunteered || a.name.localeCompare(b.name)
+  );
+
+  const totalTaughtNights = pastInWindow.filter(
+    (e) => e.status === "resolved" || e.status === "done"
+  ).length;
+  const totalSkippedNights = pastInWindow.filter((e) => e.status === "skipped").length;
+
+  document.getElementById("history-stats-subtext").textContent =
+    `${rangeLabel}: ${totalTaughtNights} taught Thursday${totalTaughtNights === 1 ? "" : "s"}${totalSkippedNights ? ` · ${totalSkippedNights} skipped` : ""}`;
+
+  document.getElementById("history-teacher-stats").innerHTML = rows.length
+    ? rows
+        .map((st) => {
+          const styleSummary = Object.entries(st.styles)
+            .map(([k, v]) => `${k}: ${v}`)
+            .join(", ");
+          return `
+          <div class="roster-row">
+            <div>
+              <strong>${escapeHtml(st.name)}</strong>
+              <div class="event-meta">
+                ${st.lastTaught ? `Last taught: ${st.lastTaught}` : "No past nights in range"}
+                ${styleSummary ? ` · ${escapeHtml(styleSummary)}` : ""}
+              </div>
+            </div>
+            <div class="action-row" style="margin-top:0;padding-top:0;">
+              <span class="pill">🕺 <strong>${st.taught}</strong> taught</span>
+              ${st.volunteered ? `<span class="pill">🙌 ${st.volunteered} assisted</span>` : ""}
+              ${st.dibsUsed ? `<span class="pill">⭐ ${st.dibsUsed} dibs</span>` : ""}
+            </div>
+          </div>
+        `;
+        })
+        .join("")
+    : `<p class="muted">No instructors on roster yet.</p>`;
+
+  document.getElementById("history-log-subtext").textContent =
+    pastInWindow.length
+      ? `Showing ${pastInWindow.length} past Thursday${pastInWindow.length === 1 ? "" : "s"} (${rangeLabel}, newest first).`
+      : `No past Thursdays recorded in ${rangeLabel.toLowerCase()}.`;
+
+  document.getElementById("history-events-list").innerHTML = pastInWindow.length
+    ? pastInWindow
+        .map((ev) => {
+          if (ev.status === "skipped") {
+            return `
+              <div class="roster-row">
+                <div>
+                  <strong>${formatDateNice(ev.date)}</strong>
+                  <div class="event-meta">🚫 Skipped${ev.notes ? ` — ${escapeHtml(ev.notes)}` : ""}</div>
+                </div>
+                <span class="badge status-skipped">Skipped</span>
+              </div>
+            `;
+          }
+          const vols = (ev.volunteers || [])
+            .map((v) => `${escapeHtml(v.name)} (${escapeHtml(v.role)})`)
+            .join(", ");
+          const teacherLabel = ev.winner_name ? escapeHtml(ev.winner_name) : "Unassigned";
+          const djLabel = ev.dj ? escapeHtml(ev.dj) : "TBD";
+          return `
+            <div class="roster-row">
+              <div>
+                <strong>${formatDateNice(ev.date)}</strong> — <strong>${teacherLabel}</strong>
+                <div class="event-meta">
+                  Lesson: ${escapeHtml((ev.lesson_type || "salsa").toUpperCase())}${ev.lesson_detail ? ` (${escapeHtml(ev.lesson_detail)})` : ""} · DJ: ${djLabel}
+                  ${vols ? ` · Assisting: ${vols}` : ""}
+                </div>
+              </div>
+              <span class="badge status-${ev.status}">${ev.resolved_via === "token" ? "⭐ Dibs" : "Taught"}</span>
+            </div>
+          `;
+        })
+        .join("")
+    : `<p class="muted">Past Thursdays will appear here once their date has passed.</p>`;
+}
+
 function renderDigests() {
   document.getElementById("digest-preview").textContent = STATE.digest || "";
   const resolved = STATE.events.filter((e) => e.status === "resolved" || e.status === "done");
@@ -613,7 +792,7 @@ document.addEventListener("DOMContentLoaded", () => {
       document.querySelectorAll("#nav-tabs .tab").forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       const tab = btn.dataset.tab;
-      ["schedule", "fairness", "digests", "admin"].forEach((t) => {
+      ["schedule", "fairness", "history", "digests", "admin"].forEach((t) => {
         document.getElementById(`tab-${t}`).classList.toggle("hidden", t !== tab);
       });
     };

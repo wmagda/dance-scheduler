@@ -1546,6 +1546,17 @@ func (s *Store) ListUpcomingEventsForViewer(ctx context.Context, viewerID int64,
 	return s.queryEvents(ctx, `WHERE e.date >= ? ORDER BY e.date ASC`, []any{todayStr}, viewerID, isAdmin)
 }
 
+// ListPastEventsForViewer returns all past Thursdays (date < today in America/Denver)
+// ordered newest-first, so the History tab can compute per-teacher teaching/volunteering
+// stats and show past nights across any date window.
+func (s *Store) ListPastEventsForViewer(ctx context.Context, viewerID int64, isAdmin bool, now time.Time) ([]EventView, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	todayStr := localDateStr(now)
+	return s.queryEvents(ctx, `WHERE e.date < ? ORDER BY e.date DESC`, []any{todayStr}, viewerID, isAdmin)
+}
+
 func (s *Store) queryEvents(ctx context.Context, clause string, args []any, viewerID int64, isAdmin bool) ([]EventView, error) {
 	resolveDays := s.GetConfigInt(ctx, "resolve_days_before", 7)
 	q := `

@@ -212,6 +212,11 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	pastEvents, err := s.store.ListPastEventsForViewer(ctx, viewerID, isAdmin, now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	teachers, err := s.store.ListTeachers(ctx, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -245,6 +250,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"viewer":         viewer,
 		"events":         events,
+		"past_events":    pastEvents,
 		"teachers":       teachers,
 		"tokens_used":    tokensUsed,
 		"config":         cfg,

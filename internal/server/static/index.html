@@ -14,7 +14,7 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <img src="/favicon.svg" alt="" class="brand-logo" width="40" height="40" />
+      <img src="/icon-192.png" alt="" class="brand-logo" width="40" height="40" />
       <div>
         <h1>Thursday Latin Dancing @ Scrumpy's</h1>
         <p class="subtitle">Fairness-Based Instructor &amp; DJ Scheduler</p>
@@ -26,6 +26,7 @@
   <nav class="tabs" id="nav-tabs">
     <button class="tab active" data-tab="schedule">📅 Thursdays (6mo)</button>
     <button class="tab" data-tab="fairness">⚖️ Fairness &amp; Dibs</button>
+    <button class="tab" data-tab="history">📊 History &amp; Stats</button>
     <button class="tab" data-tab="digests">📣 WhatsApp &amp; FB Copy</button>
     <button class="tab hidden" id="admin-tab-btn" data-tab="admin">🛠️ Admin</button>
   </nav>
@@ -89,7 +90,26 @@
       </div>
     </section>
 
-    <!-- TAB 3: WhatsApp Digest & FB Event Copy-Paste -->
+    <!-- TAB 3: History & Teacher Stats -->
+    <section id="tab-history" class="tab-panel hidden">
+      <div class="toolbar">
+        <div id="history-filters" class="month-filters"></div>
+      </div>
+      <div class="split-grid">
+        <div class="card">
+          <h2>Instructor Teaching &amp; Volunteering Stats</h2>
+          <p class="muted" id="history-stats-subtext"></p>
+          <div id="history-teacher-stats" class="roster-list"></div>
+        </div>
+        <div class="card">
+          <h2>Past Thursdays Log</h2>
+          <p class="muted" id="history-log-subtext"></p>
+          <div id="history-events-list" class="roster-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: WhatsApp Digest & FB Event Copy-Paste -->
     <section id="tab-digests" class="tab-panel hidden">
       <div class="split-grid">
         <div class="card">
