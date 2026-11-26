@@ -422,7 +422,7 @@ func (s *Server) handleUpdateProfile(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = viewer.Name
 	}
-	t, err := s.store.SaveTeacher(r.Context(), name, req.Email, req.Phone, viewer.Handle, viewer.IsAdmin, time.Now().UTC().Year())
+	t, err := s.store.UpdateTeacherProfile(r.Context(), viewer.ID, name, req.Email, req.Phone, time.Now().UTC().Year())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

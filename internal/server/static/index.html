@@ -25,7 +25,7 @@
 
   <nav class="tabs" id="nav-tabs">
     <button class="tab active" data-tab="schedule">📅 Thursdays (6mo)</button>
-    <button class="tab" data-tab="fairness">⚖️ Fairness &amp; Tokens</button>
+    <button class="tab" data-tab="fairness">⚖️ Fairness &amp; Dibs</button>
     <button class="tab" data-tab="digests">📣 WhatsApp &amp; FB Copy</button>
     <button class="tab hidden" id="admin-tab-btn" data-tab="admin">🛠️ Admin</button>
   </nav>
@@ -61,14 +61,14 @@
         <div id="month-filters" class="month-filters"></div>
         <div class="legend">
           <span class="badge status-open">Open</span>
-          <span class="badge status-tentative">Bid Placed (Resolves T-7d)</span>
+          <span class="badge status-tentative">Requested (Resolves T-7d)</span>
           <span class="badge status-resolved">Confirmed</span>
         </div>
       </div>
       <div id="events-grid" class="events-grid"></div>
     </section>
 
-    <!-- TAB 2: Fairness & Tokens -->
+    <!-- TAB 2: Fairness & Dibs -->
     <section id="tab-fairness" class="tab-panel hidden">
       <div class="split-grid">
         <div class="card">
@@ -77,8 +77,8 @@
           <div id="fairness-list" class="roster-list"></div>
         </div>
         <div class="card">
-          <h2>⭐ Veto Token Reservations</h2>
-          <p class="muted">Each instructor gets <span id="tokens-per-year-label">2</span> Veto Tokens per calendar year to lock in a special Thursday or override fairness contention.</p>
+          <h2>⭐ Calling Dibs Reservations</h2>
+          <p class="muted">Each instructor can Call Dibs <span id="tokens-per-year-label">2</span> times per calendar year to lock in a special Thursday or override fairness contention.</p>
           <div id="token-history-list" class="token-history"></div>
 
           <h3 class="subhead">⚙️ Active Fairness Rules</h3>

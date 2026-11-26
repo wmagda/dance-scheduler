@@ -129,7 +129,7 @@ function renderAuthBar() {
   bar.innerHTML = `
     <span class="pill">👤 <strong>${escapeHtml(STATE.viewer.name)}</strong>${STATE.viewer.is_admin ? " (Admin)" : ""}</span>
     <span class="pill" title="Confirmed teaching nights in rolling fairness window">⚖️ ${STATE.viewer.fairness_score} nights (${STATE.config.fairness_window_days || 90}d)</span>
-    <span class="pill" title="Remaining annual Veto Tokens">⭐ ${STATE.viewer.tokens_available}/${STATE.viewer.tokens_total} Tokens</span>
+    <span class="pill" title="Remaining annual Dibs">⭐ ${STATE.viewer.tokens_available}/${STATE.viewer.tokens_total} Dibs</span>
     <button class="btn small" id="btn-logout">Sign Out</button>
   `;
   document.getElementById("btn-logout").onclick = async () => {
@@ -164,13 +164,13 @@ function renderEvents() {
   grid.innerHTML = list
     .map((ev) => {
       const isResolved = ev.status === "resolved" || ev.status === "done";
-      let statusLabel = "Open for Bids";
-      if (ev.status === "tentative") statusLabel = `Bid Placed · Resolves ${ev.resolve_deadline}`;
+      let statusLabel = "Open to Teach";
+      if (ev.status === "tentative") statusLabel = `Requested · Resolves ${ev.resolve_deadline}`;
       if (ev.status === "recruiting") statusLabel = `Recruiting · Needs Instructor!`;
       if (isResolved) statusLabel = `Confirmed: ${escapeHtml(ev.winner_name)}`;
 
       const myBidBadge = ev.my_bid_kind
-        ? `<span class="badge status-tentative">Your Bid: ${ev.my_bid_kind === "token" ? "⭐ Veto Token" : "Normal"}</span>`
+        ? `<span class="badge status-tentative">${ev.my_bid_kind === "token" ? "⭐ You Called Dibs" : "You Asked to Teach"}</span>`
         : "";
 
       const vols = (ev.volunteers || [])
@@ -212,17 +212,17 @@ function renderEvents() {
       if (STATE.viewer && !isResolved) {
         if (!ev.my_bid_kind) {
           bidActions = `
-            <button class="btn primary small" onclick="placeBid(${ev.id}, 'normal')">Bid on Date</button>
-            <button class="btn gold small" onclick="placeBid(${ev.id}, 'token')">Use Veto Token ⭐</button>
+            <button class="btn primary small" onclick="placeBid(${ev.id}, 'normal')">Ask to Teach</button>
+            <button class="btn gold small" onclick="placeBid(${ev.id}, 'token')">Call Dibs ⭐</button>
           `;
         } else if (ev.my_bid_kind === "normal") {
           bidActions = `
-            <button class="btn gold small" onclick="placeBid(${ev.id}, 'token')">Upgrade to Token ⭐</button>
-            <button class="btn small" onclick="withdrawBid(${ev.id})">Withdraw Bid</button>
+            <button class="btn gold small" onclick="placeBid(${ev.id}, 'token')">Call Dibs Instead ⭐</button>
+            <button class="btn small" onclick="withdrawBid(${ev.id})">Cancel Request</button>
           `;
         } else {
           bidActions = `
-            <button class="btn small" onclick="withdrawBid(${ev.id})">Withdraw Token Bid</button>
+            <button class="btn small" onclick="withdrawBid(${ev.id})">Cancel Dibs</button>
           `;
         }
       }
@@ -242,10 +242,10 @@ function renderEvents() {
         const items = ev.admin_bids
           .map(
             (b, i) =>
-              `${i + 1}. ${escapeHtml(b.teacher_name)} (${b.kind}, ${b.fairness}d)`
+              `${i + 1}. ${escapeHtml(b.teacher_name)} (${b.kind === "token" ? "dibs" : "request"}, ${b.fairness}d)`
           )
           .join(" · ");
-        adminBidsHtml = `<div class="event-meta">🔒 Admin Bid Queue: ${items}</div>`;
+        adminBidsHtml = `<div class="event-meta">🔒 Admin Request Queue: ${items}</div>`;
       }
 
       const drawerOpen = STATE.openEditEventId === ev.id;
@@ -318,7 +318,7 @@ function renderEvents() {
 function renderFairness() {
   const days = STATE.config.fairness_window_days || "90";
   document.getElementById("fairness-explainer").textContent =
-    `Fewer confirmed teaching nights in the rolling ${days}-day window = higher priority when multiple instructors bid on the same Thursday. Equal start (0) at launch.`;
+    `Fewer confirmed teaching nights in the rolling ${days}-day window = higher priority when multiple instructors ask to teach the same Thursday. Equal start (0) at launch.`;
   document.getElementById("tokens-per-year-label").textContent =
     STATE.config.tokens_per_year || "2";
 
@@ -330,7 +330,7 @@ function renderFairness() {
         <div><strong>#${idx + 1} ${escapeHtml(t.name)}</strong></div>
         <div>
           <span class="pill">${t.fairness_score} nights (${days}d)</span>
-          <span class="pill">⭐ ${t.tokens_available}/${t.tokens_total} tokens</span>
+          <span class="pill">⭐ ${t.tokens_available}/${t.tokens_total} dibs</span>
         </div>
       </div>
     `
@@ -343,19 +343,19 @@ function renderFairness() {
         .map(
           (u) => `
         <div class="roster-row">
-          <div>⭐ <strong>${escapeHtml(u.teacher)}</strong> reserved <strong>${u.event_date}</strong></div>
+          <div>⭐ <strong>${escapeHtml(u.teacher)}</strong> called dibs on <strong>${u.event_date}</strong></div>
           <span class="muted">${u.year} (${escapeHtml(u.reason)})</span>
         </div>
       `
         )
         .join("")
-    : `<p class="muted">No Veto Tokens used yet this year.</p>`;
+    : `<p class="muted">Nobody has called dibs yet this year.</p>`;
 
   const publicRules = [
     { label: "Fairness Window", val: `${STATE.config.fairness_window_days || "90"} days rolling` },
-    { label: "Bids Lock & Resolve", val: `T-${STATE.config.resolve_days_before || "7"} days before` },
+    { label: "Requests Lock & Resolve", val: `T-${STATE.config.resolve_days_before || "7"} days before` },
     { label: "Open-Date Recruit Nudge", val: `T-${STATE.config.recruit_days_before || "14"} days before` },
-    { label: "Veto Tokens Granted", val: `${STATE.config.tokens_per_year || "2"} / calendar year` },
+    { label: "Dibs Allowed", val: `${STATE.config.tokens_per_year || "2"} / calendar year` },
     { label: "Schedule Horizon", val: `${STATE.config.months_open_ahead || "6"} months ahead` },
   ];
   const pubEl = document.getElementById("public-config-list");
@@ -412,7 +412,7 @@ function renderAdmin() {
           ${t.is_admin ? `<span class="badge status-resolved">Admin</span>` : ""}
         </div>
         <div class="action-row">
-          <button class="btn small gold" onclick="grantBonusToken(${t.id})">+1 Token ⭐</button>
+          <button class="btn small gold" onclick="grantBonusToken(${t.id})">+1 Dibs ⭐</button>
           <button class="btn small" onclick="removeTeacher(${t.id})">Remove</button>
         </div>
       </div>
@@ -424,7 +424,7 @@ function renderAdmin() {
     fairness_window_days: "Fairness Window (days)",
     resolve_days_before: "Resolve Deadline (days before)",
     recruit_days_before: "Recruit Alert (days before)",
-    tokens_per_year: "Veto Tokens / Year",
+    tokens_per_year: "Dibs / Year",
     months_open_ahead: "Months Open Ahead",
     invite_ttl_days: "Invite Link Lifetime (days)",
   };
@@ -461,7 +461,7 @@ function renderAdmin() {
 window.placeBid = async (eventId, kind) => {
   try {
     await api("/api/bids", { event_id: eventId, kind });
-    showToast(kind === "token" ? "⭐ Veto Token bid placed!" : "Bid placed!");
+    showToast(kind === "token" ? "⭐ Called dibs on this Thursday!" : "Asked to teach this Thursday!");
     await loadState();
   } catch (err) {
     showToast(err.message);
@@ -471,7 +471,7 @@ window.placeBid = async (eventId, kind) => {
 window.withdrawBid = async (eventId) => {
   try {
     await api("/api/bids/withdraw", { event_id: eventId });
-    showToast("Bid withdrawn.");
+    showToast("Request canceled.");
     await loadState();
   } catch (err) {
     showToast(err.message);
@@ -544,7 +544,7 @@ window.grantBonusToken = async (teacherId) => {
       year: new Date().getUTCFullYear(),
       reason: "special occasion bonus",
     });
-    showToast("Granted +1 Veto Token!");
+    showToast("Granted +1 Dibs!");
     await loadState();
   } catch (err) {
     showToast(err.message);

@@ -530,6 +530,51 @@ func (s *Store) SaveTeacher(ctx context.Context, name, email, phone, handle stri
 	return s.GetTeacherByID(ctx, existingID, time.Now().UTC())
 }
 
+// UpdateTeacherProfile updates an authenticated teacher's own record by ID,
+// rejecting collisions with another teacher's email or phone.
+func (s *Store) UpdateTeacherProfile(ctx context.Context, teacherID int64, name, email, phone string, year int) (*Teacher, error) {
+	name = strings.TrimSpace(name)
+	phone = NormalizePhone(phone)
+	if strings.TrimSpace(email) != "" {
+		validEmail, err := ValidateEmail(email)
+		if err != nil {
+			return nil, err
+		}
+		email = validEmail
+	} else {
+		email = ""
+	}
+	if name == "" {
+		return nil, errors.New("instructor name is required")
+	}
+	if email != "" {
+		var otherID int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE email = ? AND id != ?`, email, teacherID).Scan(&otherID); err == nil {
+			return nil, errors.New("that email address is already registered to another instructor")
+		}
+	}
+	if phone != "" {
+		var otherID int64
+		if err := s.db.QueryRowContext(ctx, `SELECT id FROM teachers WHERE phone = ? AND id != ?`, phone, teacherID).Scan(&otherID); err == nil {
+			return nil, errors.New("that phone number is already registered to another instructor")
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE teachers
+		SET name = ?,
+		    email = CASE WHEN ? != '' THEN ? ELSE email END,
+		    phone = CASE WHEN ? != '' THEN ? ELSE phone END
+		WHERE id = ?
+	`, name, email, email, phone, phone, teacherID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.EnsureYearTokens(ctx, teacherID, year); err != nil {
+		return nil, err
+	}
+	return s.GetTeacherByID(ctx, teacherID, time.Now().UTC())
+}
+
 func (s *Store) RemoveTeacher(ctx context.Context, teacherID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE teachers SET active = 0 WHERE id = ?`, teacherID)
 	return err
@@ -878,7 +923,7 @@ func (s *Store) PlaceBid(ctx context.Context, teacherID int64, eventID int64, ki
 			return err
 		}
 		if avail <= 0 {
-			return fmt.Errorf("no veto tokens remaining for %d", evTime.Year())
+			return fmt.Errorf("no dibs remaining for %d", evTime.Year())
 		}
 	}
 
@@ -912,7 +957,7 @@ func (s *Store) PlaceBid(ctx context.Context, teacherID int64, eventID int64, ki
 	if kind == "token" {
 		t, err := s.GetTeacherByID(ctx, teacherID, now)
 		if err == nil {
-			_ = s.hub.PostToGroup(ctx, fmt.Sprintf("⭐ %s placed a Veto Token reservation on Thursday %s (resolves %s).", t.Name, eventDate, deadline))
+			_ = s.hub.PostToGroup(ctx, fmt.Sprintf("⭐ %s called dibs on Thursday %s (resolves %s).", t.Name, eventDate, deadline))
 		}
 	}
 
@@ -922,17 +967,21 @@ func (s *Store) PlaceBid(ctx context.Context, teacherID int64, eventID int64, ki
 	}
 	if len(ranked) == 1 {
 		b := ranked[0]
+		reqKind := "teaching request"
+		if b.Kind == "token" {
+			reqKind = "dibs"
+		}
 		_ = s.hub.SendDM(ctx, b.recipient,
-			fmt.Sprintf("You hold Thursday %s tentatively (%s bid) — it can still be outbid until %s. Edit your lesson/DJ details: %s",
-				eventDate, b.Kind, deadline, s.baseURL))
+			fmt.Sprintf("You hold Thursday %s tentatively (%s) — another instructor can still ask to teach or call dibs until %s. Edit your lesson/DJ details: %s",
+				eventDate, reqKind, deadline, s.baseURL))
 	} else if len(ranked) > 1 {
 		for idx, b := range ranked {
-			standing := "trailing on fairness/token priority"
+			standing := "trailing on fairness/dibs priority"
 			if idx == 0 {
-				standing = "currently in 1st place to win"
+				standing = "currently in 1st place to teach"
 			}
 			_ = s.hub.SendDM(ctx, b.recipient,
-				fmt.Sprintf("Thursday %s now has multiple bids and will resolve on %s. You are %s. Manage your bids: %s",
+				fmt.Sprintf("Thursday %s now has multiple instructors asking to teach and will resolve on %s. You are %s. Manage your requests: %s",
 					eventDate, deadline, standing, s.baseURL))
 		}
 	}
@@ -1136,7 +1185,7 @@ func (s *Store) RunResolver(ctx context.Context, now time.Time, forceEventID int
 			groupMsg := fmt.Sprintf("✅ Resolved for Thursday %s: %s is teaching (%s, DJ: %s).",
 				ev.date, winner.TeacherName, strings.Title(evView.LessonType), djLabel)
 			if winner.Kind == "token" {
-				groupMsg += " [Reserved with Veto Token ⭐]"
+				groupMsg += " [Called Dibs ⭐]"
 			}
 			_ = s.hub.PostToGroup(ctx, groupMsg)
 			_ = s.RecordOutbox(ctx, transport.ChannelFBEvent, "Facebook Event Copy", evView.FBEventCopy)
@@ -1232,7 +1281,7 @@ func (s *Store) RunRecruitment(ctx context.Context, now time.Time) (recruited in
 			if t.IsAdmin {
 				_ = s.hub.SendDM(ctx, transport.Recipient{
 					TeacherID: t.ID, Name: t.Name, Email: t.Email, Phone: t.Phone, Handle: t.Handle,
-				}, fmt.Sprintf("⚠️ Admin Escalation: Thursday %s is within %d days and still has ZERO bids. Manage at %s",
+				}, fmt.Sprintf("⚠️ Admin Escalation: Thursday %s is within %d days and nobody has asked to teach yet. Manage at %s",
 					ev.date, resolveDays, s.baseURL))
 			}
 		}
@@ -1331,7 +1380,7 @@ func (s *Store) VolunteerForEvent(ctx context.Context, actor *Teacher, eventID i
 		return err
 	}
 	if !ev.CanVolunteer {
-		return errors.New("you cannot volunteer as a helper on a night you are teaching or bidding on")
+		return errors.New("you cannot volunteer as a helper on a night you are teaching or have asked to teach")
 	}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO confirmations(teacher_id, event_id, role) VALUES (?, ?, ?)`,
@@ -1579,18 +1628,18 @@ func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string
 			}
 			lines = append(lines, line)
 		default:
-			line := fmt.Sprintf("• *%s*: Open for bids (resolves %s)", ev.Date, ev.ResolveDeadline)
+			line := fmt.Sprintf("• *%s*: Open to teach (resolves %s)", ev.Date, ev.ResolveDeadline)
 			if ev.NeedLead || ev.NeedFollow || ev.NeedCo {
 				req := ev.HelpRequester
 				if req == "" {
-					req = "A bidder"
+					req = "An instructor"
 				}
 				line += fmt.Sprintf(" — 🤝 *%s needs Lead/Follow help*", req)
 			}
 			lines = append(lines, line)
 		}
 	}
-	lines = append(lines, fmt.Sprintf("\n📅 Bid on dates (6mo open) or volunteer: %s", s.baseURL))
+	lines = append(lines, fmt.Sprintf("\n📅 Ask to teach (6mo open) or volunteer: %s", s.baseURL))
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -1761,13 +1810,13 @@ func (s *Store) ExecuteBotCommand(ctx context.Context, fromPhone, rawText string
 	}
 	cmd, err := s.hub.ParseCommand(rawText)
 	if err != nil {
-		return "Commands: `/claim YYYY-MM-DD`, `/token YYYY-MM-DD`, `/lead YYYY-MM-DD`, `/follow YYYY-MM-DD`, `/status`, `/help`. Web app: " + s.baseURL, nil
+		return "Commands: `/teach YYYY-MM-DD`, `/dibs YYYY-MM-DD`, `/lead YYYY-MM-DD`, `/follow YYYY-MM-DD`, `/status`, `/help`. Web app: " + s.baseURL, nil
 	}
 	switch cmd.Type {
 	case transport.CmdHelp:
-		return "Commands:\n• `/claim YYYY-MM-DD` — place a normal bid\n• `/token YYYY-MM-DD` — place a Veto Token bid\n• `/lead YYYY-MM-DD` / `/follow YYYY-MM-DD` — volunteer\n• `/status` — your fairness & token balance\nFull calendar & event details: " + s.baseURL, nil
+		return "Commands:\n• `/teach YYYY-MM-DD` — ask to teach\n• `/dibs YYYY-MM-DD` — call dibs on a date\n• `/lead YYYY-MM-DD` / `/follow YYYY-MM-DD` — volunteer\n• `/status` — your fairness & dibs balance\nFull calendar & event details: " + s.baseURL, nil
 	case transport.CmdStatus:
-		return fmt.Sprintf("%s: %d confirmed nights in last 90d | %d/%d Veto Tokens available. Full schedule: %s",
+		return fmt.Sprintf("%s: %d confirmed nights in last 90d | %d/%d Dibs available. Full schedule: %s",
 			t.Name, t.FairnessScore, t.TokensAvailable, t.TokensTotal, s.baseURL), nil
 	case transport.CmdClaim, transport.CmdToken:
 		var evID int64
@@ -1779,9 +1828,13 @@ func (s *Store) ExecuteBotCommand(ctx context.Context, fromPhone, rawText string
 			kind = "token"
 		}
 		if err := s.PlaceBid(ctx, t.ID, evID, kind, now); err != nil {
-			return "Bid error: " + err.Error(), nil
+			return "Request error: " + err.Error(), nil
 		}
-		return fmt.Sprintf("Bid recorded (%s) for Thursday %s! Set your lesson type & DJ here: %s", kind, cmd.DateArg, s.baseURL), nil
+		label := "teaching request"
+		if kind == "token" {
+			label = "dibs"
+		}
+		return fmt.Sprintf("Recorded (%s) for Thursday %s! Set your lesson type & DJ here: %s", label, cmd.DateArg, s.baseURL), nil
 	case transport.CmdLead, transport.CmdFollow:
 		var evID int64
 		if err := s.db.QueryRowContext(ctx, `SELECT id FROM events WHERE date = ?`, cmd.DateArg).Scan(&evID); err != nil {

@@ -245,14 +245,14 @@ func (h *Hub) ParseCommand(raw string) (*Command, error) {
 		arg = strings.Join(parts[1:], " ")
 	}
 	switch verb {
-	case "claim", "bid":
+	case "claim", "bid", "teach", "ask":
 		if arg == "" {
-			return nil, fmt.Errorf("usage: /claim YYYY-MM-DD")
+			return nil, fmt.Errorf("usage: /teach YYYY-MM-DD")
 		}
 		return &Command{Type: CmdClaim, DateArg: arg, Raw: raw}, nil
-	case "token", "veto", "reserve":
+	case "token", "veto", "reserve", "dibs":
 		if arg == "" {
-			return nil, fmt.Errorf("usage: /token YYYY-MM-DD")
+			return nil, fmt.Errorf("usage: /dibs YYYY-MM-DD")
 		}
 		return &Command{Type: CmdToken, DateArg: arg, Raw: raw}, nil
 	case "lead":
