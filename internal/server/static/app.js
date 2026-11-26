@@ -142,8 +142,15 @@ function renderAuthBar() {
 }
 
 function renderMonthFilters() {
+  const schedTabBtn = document.getElementById("schedule-tab-btn");
+  if (schedTabBtn) {
+    schedTabBtn.textContent = `📅 Thursdays (${STATE.config.months_open_ahead || 6}mo)`;
+  }
   const container = document.getElementById("month-filters");
   const months = Array.from(new Set(STATE.events.map((e) => e.date.slice(0, 7))));
+  if (STATE.selectedMonth !== "all" && !months.includes(STATE.selectedMonth)) {
+    STATE.selectedMonth = "all";
+  }
   let html = `<button class="btn small ${STATE.selectedMonth === "all" ? "primary" : ""}" data-m="all">All (${STATE.events.length})</button>`;
   for (const m of months) {
     html += `<button class="btn small ${STATE.selectedMonth === m ? "primary" : ""}" data-m="${m}">${m}</button>`;

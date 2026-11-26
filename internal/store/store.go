@@ -366,11 +366,16 @@ func migrateSchema(db *sql.DB) error {
 	return nil
 }
 
-func localDateStr(t time.Time) string {
+func localDate(t time.Time) time.Time {
 	if loc, err := time.LoadLocation("America/Denver"); err == nil {
-		return t.In(loc).Format("2006-01-02")
+		lt := t.In(loc)
+		return time.Date(lt.Year(), lt.Month(), lt.Day(), 0, 0, 0, 0, time.UTC)
 	}
-	return t.UTC().Format("2006-01-02")
+	return time.Date(t.UTC().Year(), t.UTC().Month(), t.UTC().Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func localDateStr(t time.Time) string {
+	return localDate(t).Format("2006-01-02")
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -919,7 +924,7 @@ func (s *Store) ListUsedTokens(ctx context.Context) ([]TokenUse, error) {
 // months_open_ahead months. Quietly idempotent (no group spam on open).
 func (s *Store) EnsureUpcomingThursdays(ctx context.Context, fromDate time.Time) error {
 	months := s.GetConfigInt(ctx, "months_open_ahead", 6)
-	start := time.Date(fromDate.Year(), fromDate.Month(), fromDate.Day(), 0, 0, 0, 0, time.UTC)
+	start := localDate(fromDate)
 	end := start.AddDate(0, months, 0)
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		if d.Weekday() == time.Thursday {
@@ -1542,8 +1547,11 @@ func (s *Store) ListUpcomingEventsForViewer(ctx context.Context, viewerID int64,
 	if now.IsZero() {
 		return s.queryEvents(ctx, `ORDER BY e.date ASC`, nil, viewerID, isAdmin)
 	}
-	todayStr := localDateStr(now)
-	return s.queryEvents(ctx, `WHERE e.date >= ? ORDER BY e.date ASC`, []any{todayStr}, viewerID, isAdmin)
+	months := s.GetConfigInt(ctx, "months_open_ahead", 6)
+	start := localDate(now)
+	todayStr := start.Format("2006-01-02")
+	horizonStr := start.AddDate(0, months, 0).Format("2006-01-02")
+	return s.queryEvents(ctx, `WHERE e.date >= ? AND e.date <= ? ORDER BY e.date ASC`, []any{todayStr, horizonStr}, viewerID, isAdmin)
 }
 
 // ListPastEventsForViewer returns all past Thursdays (date < today in America/Denver)
