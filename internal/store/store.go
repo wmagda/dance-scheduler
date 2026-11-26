@@ -1782,12 +1782,14 @@ func FormatFacebookEvent(ev EventView) string {
 
 // GenerateWeeklyDigest builds a low-noise WhatsApp group summary of the next 4 weeks.
 func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string, error) {
-	events, err := s.ListEventsForViewer(ctx, 0, false)
+	events, err := s.ListUpcomingEventsForViewer(ctx, 0, false, now)
 	if err != nil {
 		return "", err
 	}
-	startStr := now.UTC().Format("2006-01-02")
-	endStr := now.UTC().AddDate(0, 0, 28).Format("2006-01-02")
+	start := localDate(now)
+	startStr := start.Format("2006-01-02")
+	endStr := start.AddDate(0, 0, 28).Format("2006-01-02")
+	monthsOpen := s.GetConfigInt(ctx, "months_open_ahead", 6)
 
 	var lines []string
 	lines = append(lines, "💃 *Thursday Latin Dancing at Scrumpy's — Next 4 Weeks*")
@@ -1824,7 +1826,7 @@ func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string
 			lines = append(lines, line)
 		}
 	}
-	lines = append(lines, fmt.Sprintf("\n📅 Ask to teach (6mo open) or volunteer: %s", s.baseURL))
+	lines = append(lines, fmt.Sprintf("\n📅 Ask to teach (%dmo open) or volunteer: %s", monthsOpen, s.baseURL))
 	return strings.Join(lines, "\n"), nil
 }
 
