@@ -260,7 +260,7 @@ function renderEvents() {
         adminBidsHtml = `<div class="event-meta">🔒 Admin Request Queue: ${items}</div>`;
       }
 
-      const drawerOpen = STATE.openEditEventId === ev.id;
+      const drawerOpen = STATE.openEditEventId === ev.id && ev.can_edit_details && !isSkipped;
       const drawerHtml = drawerOpen
         ? `
         <div class="details-drawer">
@@ -663,6 +663,7 @@ window.placeBid = async (eventId, kind) => {
 window.withdrawBid = async (eventId) => {
   try {
     await api("/api/bids/withdraw", { event_id: eventId });
+    if (STATE.openEditEventId === eventId) STATE.openEditEventId = null;
     showToast("Request canceled.");
     await loadState();
   } catch (err) {
@@ -722,6 +723,7 @@ window.unvolunteer = async (eventId, teacherId, role) => {
 window.forceResolve = async (eventId) => {
   try {
     await api("/api/admin/resolve", { event_id: eventId });
+    if (STATE.openEditEventId === eventId) STATE.openEditEventId = null;
     showToast("Date resolved!");
     await loadState();
   } catch (err) {
@@ -738,6 +740,7 @@ window.toggleSkipDate = async (eventId, skip) => {
       reason = input.trim();
     }
     await api("/api/admin/events/skip", { event_id: eventId, skip, reason });
+    if (STATE.openEditEventId === eventId) STATE.openEditEventId = null;
     showToast(skip ? "Thursday marked as skipped." : "Thursday re-opened for teaching requests!");
     await loadState();
   } catch (err) {
