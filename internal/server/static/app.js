@@ -3,6 +3,7 @@ let STATE = {
   events: [],
   past_events: [],
   teachers: [],
+  admin_teachers: [],
   tokens_used: [],
   config: {},
   transport_mode: "manual",
@@ -600,24 +601,57 @@ function renderAdmin() {
   document.getElementById("transport-mode-label").textContent = STATE.transport_mode;
   setInviteUI(STATE.invite, STATE.invite_token);
 
-  document.getElementById("admin-roster-list").innerHTML = STATE.teachers
-    .map(
-      (t) => `
+  const allTeachers = STATE.admin_teachers && STATE.admin_teachers.length ? STATE.admin_teachers : STATE.teachers;
+  const activeTeachers = allTeachers.filter((t) => t.active !== false);
+  const inactiveTeachers = allTeachers.filter((t) => t.active === false);
+
+  const renderTeacherRow = (t) => {
+    const isSelf = STATE.viewer && t.id === STATE.viewer.id;
+    const joinedDate = t.created_at ? t.created_at.slice(0, 10) : "";
+    return `
       <div class="roster-row">
         <div>
           <strong>${escapeHtml(t.name)}</strong>
-          ${t.email ? ` · <span class="muted">${escapeHtml(t.email)}</span>` : ""}
-          ${t.phone ? ` · <span class="muted">${escapeHtml(t.phone)}</span>` : ""}
           ${t.is_admin ? `<span class="badge status-resolved">Admin</span>` : ""}
+          ${t.active === false ? `<span class="badge status-skipped">Removed</span>` : ""}
+          <div class="event-meta">
+            📧 ${t.email ? escapeHtml(t.email) : "<em>no email</em>"}
+            · 📱 ${t.phone ? escapeHtml(t.phone) : "<em>no phone</em>"}
+            ${joinedDate ? ` · Joined ${escapeHtml(joinedDate)}` : ""}
+          </div>
+          <div class="event-meta">
+            ⚖️ ${t.fairness_score} nights (90d) · ⭐ ${t.tokens_available}/${t.tokens_total} dibs available
+          </div>
         </div>
-        <div class="action-row">
-          <button class="btn small gold" onclick="grantBonusToken(${t.id})">+1 Dibs ⭐</button>
-          <button class="btn small" onclick="removeTeacher(${t.id})">Remove</button>
+        <div class="action-row" style="margin-top:0;padding-top:0;">
+          ${
+            t.active === false
+              ? `<button class="btn small primary" onclick="restoreTeacher(${JSON.stringify(t.name)}, ${JSON.stringify(t.email || "")}, ${JSON.stringify(t.phone || "")}, ${Boolean(t.is_admin)})">↩️ Restore</button>`
+              : `
+                <button class="btn small gold" onclick="grantBonusToken(${t.id})">+1 Dibs ⭐</button>
+                ${
+                  isSelf
+                    ? `<span class="muted" style="font-size:0.78rem;align-self:center;">(You)</span>`
+                    : `<button class="btn small" onclick="removeTeacher(${t.id}, ${JSON.stringify(t.name)})">🗑️ Remove</button>`
+                }
+              `
+          }
         </div>
       </div>
-    `
-    )
-    .join("");
+    `;
+  };
+
+  let rosterHtml = activeTeachers.length
+    ? activeTeachers.map(renderTeacherRow).join("")
+    : `<p class="muted">No active instructors.</p>`;
+
+  if (inactiveTeachers.length) {
+    rosterHtml += `
+      <h4 class="subhead" style="margin-top:1.1rem;margin-bottom:0.25rem;font-size:0.9rem;color:var(--muted);">Removed / Inactive Instructors (${inactiveTeachers.length})</h4>
+      ${inactiveTeachers.map(renderTeacherRow).join("")}
+    `;
+  }
+  document.getElementById("admin-roster-list").innerHTML = rosterHtml;
 
   const cfgLabels = {
     fairness_window_days: "Fairness Window (days)",
@@ -769,10 +803,33 @@ window.grantBonusToken = async (teacherId) => {
   }
 };
 
-window.removeTeacher = async (teacherId) => {
+window.removeTeacher = async (teacherId, teacherName) => {
+  const label = teacherName || "this instructor";
+  if (
+    !window.confirm(
+      `Remove ${label} from the active instructor roster?\n\nThis will sign them out and cancel any of their pending teaching requests on unresolved future Thursdays.`
+    )
+  ) {
+    return;
+  }
   try {
     await api("/api/admin/teachers/remove", { teacher_id: teacherId });
-    showToast("Instructor removed from active roster.");
+    showToast(`${label} removed from active roster.`);
+    await loadState();
+  } catch (err) {
+    showToast(err.message);
+  }
+};
+
+window.restoreTeacher = async (name, email, phone, isAdmin) => {
+  try {
+    await api("/api/admin/teachers", {
+      name,
+      email,
+      phone,
+      is_admin: Boolean(isAdmin),
+    });
+    showToast(`${name} restored to active roster!`);
     await loadState();
   } catch (err) {
     showToast(err.message);

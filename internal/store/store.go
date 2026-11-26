@@ -143,6 +143,7 @@ type Teacher struct {
 	Handle          string     `json:"handle"`
 	IsAdmin         bool       `json:"is_admin"`
 	Active          bool       `json:"active"`
+	CreatedAt       string     `json:"created_at,omitempty"`
 	FairnessScore   int        `json:"fairness_score"`
 	TokensAvailable int        `json:"tokens_available"`
 	TokensTotal     int        `json:"tokens_total"`
@@ -624,8 +625,41 @@ func (s *Store) UpdateTeacherProfile(ctx context.Context, teacherID int64, name,
 }
 
 func (s *Store) RemoveTeacher(ctx context.Context, teacherID int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE teachers SET active = 0 WHERE id = ?`, teacherID)
-	return err
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	todayStr := localDateStr(time.Now().UTC())
+
+	if _, err := s.db.ExecContext(ctx, `UPDATE teachers SET active = 0 WHERE id = ?`, teacherID); err != nil {
+		return err
+	}
+	// Revoke any active login sessions for the removed teacher
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM sessions WHERE teacher_id = ?`, teacherID)
+	// Withdraw any pending requests/dibs on unresolved future dates
+	_, _ = s.db.ExecContext(ctx, `
+		UPDATE bids
+		SET withdrawn_at = ?
+		WHERE teacher_id = ?
+		  AND withdrawn_at IS NULL
+		  AND event_id IN (SELECT id FROM events WHERE status IN ('open', 'tentative', 'recruiting') AND date >= ?)
+	`, nowStr, teacherID, todayStr)
+	// Remove volunteer confirmations on future dates
+	_, _ = s.db.ExecContext(ctx, `
+		DELETE FROM confirmations
+		WHERE teacher_id = ?
+		  AND event_id IN (SELECT id FROM events WHERE date >= ?)
+	`, teacherID, todayStr)
+	// Reset any tentative future event back to 'open' if no active bids remain
+	_, _ = s.db.ExecContext(ctx, `
+		UPDATE events
+		SET status = 'open', need_lead = 0, need_follow = 0, need_co = 0
+		WHERE status = 'tentative'
+		  AND date >= ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM bids b
+			JOIN teachers t ON t.id = b.teacher_id
+			WHERE b.event_id = events.id AND b.withdrawn_at IS NULL AND t.active = 1
+		  )
+	`, todayStr)
+	return nil
 }
 
 // GetInviteStatus returns the current self-signup invite token, its expiration
@@ -849,8 +883,8 @@ func (s *Store) GetTeacherByID(ctx context.Context, id int64, refTime time.Time)
 	var t Teacher
 	var isAdmin, active int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, email, phone, handle, is_admin, active FROM teachers WHERE id = ?`, id,
-	).Scan(&t.ID, &t.Name, &t.Email, &t.Phone, &t.Handle, &isAdmin, &active)
+		`SELECT id, name, email, phone, handle, is_admin, active, COALESCE(created_at, '') FROM teachers WHERE id = ?`, id,
+	).Scan(&t.ID, &t.Name, &t.Email, &t.Phone, &t.Handle, &isAdmin, &active, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -872,6 +906,34 @@ func (s *Store) GetTeacherByID(ctx context.Context, id int64, refTime time.Time)
 
 func (s *Store) ListTeachers(ctx context.Context, refTime time.Time) ([]Teacher, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM teachers WHERE active = 1 ORDER BY name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+
+	var out []Teacher
+	for _, id := range ids {
+		t, err := s.GetTeacherByID(ctx, id, refTime)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, nil
+}
+
+// ListAllTeachers returns both active and inactive teachers for the Admin roster view.
+func (s *Store) ListAllTeachers(ctx context.Context, refTime time.Time) ([]Teacher, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM teachers ORDER BY active DESC, name ASC`)
 	if err != nil {
 		return nil, err
 	}

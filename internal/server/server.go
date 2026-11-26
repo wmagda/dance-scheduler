@@ -243,12 +243,22 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	var outbox []store.OutboxEntry
 	var inviteStatus *store.InviteStatus
 	inviteToken := ""
+	var adminTeachers []store.Teacher
 	if isAdmin {
 		outbox, _ = s.store.ListOutbox(ctx, 50)
+		adminTeachers, _ = s.store.ListAllTeachers(ctx, now)
 		if st, err := s.store.GetInviteStatus(ctx, now); err == nil {
 			inviteStatus = &st
 			if st.Active {
 				inviteToken = st.Token
+			}
+		}
+	} else {
+		// Redact contact PII from the public roster payload for non-admin viewers.
+		for i := range teachers {
+			if teachers[i].ID != viewerID {
+				teachers[i].Email = ""
+				teachers[i].Phone = ""
 			}
 		}
 	}
@@ -258,6 +268,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		"events":         events,
 		"past_events":    pastEvents,
 		"teachers":       teachers,
+		"admin_teachers": adminTeachers,
 		"tokens_used":    tokensUsed,
 		"config":         cfg,
 		"transport_mode": s.store.Hub().Name(),
@@ -609,7 +620,8 @@ func (s *Server) handleAdminAddTeacher(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAdminRemoveTeacher(w http.ResponseWriter, r *http.Request) {
-	if s.requireAdmin(w, r) == nil {
+	viewer := s.requireAdmin(w, r)
+	if viewer == nil {
 		return
 	}
 	var req struct {
@@ -617,6 +629,10 @@ func (s *Server) handleAdminRemoveTeacher(w http.ResponseWriter, r *http.Request
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.TeacherID == viewer.ID {
+		writeErr(w, http.StatusBadRequest, "you cannot remove your own admin account")
 		return
 	}
 	if err := s.store.RemoveTeacher(r.Context(), req.TeacherID); err != nil {
