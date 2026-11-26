@@ -238,6 +238,12 @@ input:focus, select:focus, textarea:focus {
   border: 1px solid rgba(16, 185, 129, 0.35);
 }
 
+.status-skipped {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--muted);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
 .events-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));

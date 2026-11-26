@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS teachers (
 CREATE TABLE IF NOT EXISTS events (
 	id                INTEGER PRIMARY KEY AUTOINCREMENT,
 	date              TEXT NOT NULL UNIQUE, -- YYYY-MM-DD (Thursday)
-	status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','tentative','recruiting','resolved','done')),
+	status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','tentative','recruiting','resolved','done','skipped')),
 	winner_teacher_id INTEGER REFERENCES teachers(id),
 	resolved_via      TEXT NOT NULL DEFAULT '',
 	lesson_type       TEXT NOT NULL DEFAULT 'salsa',
@@ -327,7 +327,50 @@ func migrateSchema(db *sql.DB) error {
 			return err
 		}
 	}
+
+	var eventsSQL string
+	_ = db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'`).Scan(&eventsSQL)
+	if eventsSQL != "" && !strings.Contains(eventsSQL, "'skipped'") {
+		stmts := `
+			PRAGMA foreign_keys = OFF;
+			BEGIN TRANSACTION;
+			CREATE TABLE events_new (
+				id                INTEGER PRIMARY KEY AUTOINCREMENT,
+				date              TEXT NOT NULL UNIQUE,
+				status            TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','tentative','recruiting','resolved','done','skipped')),
+				winner_teacher_id INTEGER REFERENCES teachers(id),
+				resolved_via      TEXT NOT NULL DEFAULT '',
+				lesson_type       TEXT NOT NULL DEFAULT 'salsa',
+				lesson_detail     TEXT NOT NULL DEFAULT '',
+				dj                TEXT NOT NULL DEFAULT '',
+				notes             TEXT NOT NULL DEFAULT '',
+				need_lead         INTEGER NOT NULL DEFAULT 0,
+				need_follow       INTEGER NOT NULL DEFAULT 0,
+				need_co           INTEGER NOT NULL DEFAULT 0,
+				escalated         INTEGER NOT NULL DEFAULT 0,
+				resolved_at       TEXT,
+				created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+			);
+			INSERT INTO events_new(id, date, status, winner_teacher_id, resolved_via, lesson_type, lesson_detail, dj, notes, need_lead, need_follow, need_co, escalated, resolved_at, created_at)
+			SELECT id, date, status, winner_teacher_id, resolved_via, lesson_type, lesson_detail, dj, notes, need_lead, need_follow, need_co, escalated, resolved_at, created_at FROM events;
+			DROP TABLE events;
+			ALTER TABLE events_new RENAME TO events;
+			COMMIT;
+			PRAGMA foreign_keys = ON;
+		`
+		if _, err := db.Exec(stmts); err != nil {
+			_, _ = db.Exec(`ROLLBACK; PRAGMA foreign_keys = ON;`)
+			return err
+		}
+	}
 	return nil
+}
+
+func localDateStr(t time.Time) string {
+	if loc, err := time.LoadLocation("America/Denver"); err == nil {
+		return t.In(loc).Format("2006-01-02")
+	}
+	return t.UTC().Format("2006-01-02")
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -904,6 +947,9 @@ func (s *Store) PlaceBid(ctx context.Context, teacherID int64, eventID int64, ki
 	if status == "resolved" || status == "done" {
 		return errors.New("this date is already resolved")
 	}
+	if status == "skipped" {
+		return errors.New("this Thursday is skipped (no event scheduled)")
+	}
 	evTime, err := time.Parse("2006-01-02", eventDate)
 	if err != nil {
 		return err
@@ -993,8 +1039,8 @@ func (s *Store) WithdrawBid(ctx context.Context, teacherID, eventID int64, now t
 	if err := s.db.QueryRowContext(ctx, `SELECT status FROM events WHERE id = ?`, eventID).Scan(&status); err != nil {
 		return err
 	}
-	if status == "resolved" || status == "done" {
-		return errors.New("cannot withdraw from a resolved date")
+	if status == "resolved" || status == "done" || status == "skipped" {
+		return errors.New("cannot withdraw from a resolved or skipped date")
 	}
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE bids SET withdrawn_at = ? WHERE event_id = ? AND teacher_id = ? AND withdrawn_at IS NULL`,
@@ -1437,6 +1483,46 @@ func (s *Store) UnvolunteerForEvent(ctx context.Context, actor *Teacher, eventID
 	return nil
 }
 
+// SetEventSkipped marks a Thursday date as skipped (e.g. holiday closure) or re-opens it.
+// When skipping, any active requests/dibs and confirmations on that date are cleared and any
+// spent dibs token is refunded.
+func (s *Store) SetEventSkipped(ctx context.Context, eventID int64, skip bool, reason string, now time.Time) error {
+	var eventDate, status string
+	if err := s.db.QueryRowContext(ctx, `SELECT date, status FROM events WHERE id = ?`, eventID).Scan(&eventDate, &status); err != nil {
+		return fmt.Errorf("event not found: %w", err)
+	}
+	nowStr := now.UTC().Format(time.RFC3339)
+	if skip {
+		reason = strings.TrimSpace(reason)
+		_, _ = s.db.ExecContext(ctx, `UPDATE bids SET withdrawn_at = ? WHERE event_id = ? AND withdrawn_at IS NULL`, nowStr, eventID)
+		_, _ = s.db.ExecContext(ctx, `DELETE FROM confirmations WHERE event_id = ?`, eventID)
+		_, _ = s.db.ExecContext(ctx, `UPDATE tokens SET used_event_id = NULL, used_at = NULL WHERE used_event_id = ?`, eventID)
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE events
+			SET status = 'skipped',
+			    winner_teacher_id = NULL,
+			    resolved_via = '',
+			    resolved_at = NULL,
+			    need_lead = 0,
+			    need_follow = 0,
+			    need_co = 0,
+			    notes = ?
+			WHERE id = ?
+		`, reason, eventID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE events
+		SET status = 'open',
+		    winner_teacher_id = NULL,
+		    resolved_via = '',
+		    resolved_at = NULL,
+		    notes = ''
+		WHERE id = ?
+	`, eventID)
+	return err
+}
+
 func (s *Store) GetEventView(ctx context.Context, eventID int64, viewerID int64, isAdmin bool) (*EventView, error) {
 	list, err := s.queryEvents(ctx, `WHERE e.id = ?`, []any{eventID}, viewerID, isAdmin)
 	if err != nil {
@@ -1449,7 +1535,15 @@ func (s *Store) GetEventView(ctx context.Context, eventID int64, viewerID int64,
 }
 
 func (s *Store) ListEventsForViewer(ctx context.Context, viewerID int64, isAdmin bool) ([]EventView, error) {
-	return s.queryEvents(ctx, `ORDER BY e.date ASC`, nil, viewerID, isAdmin)
+	return s.ListUpcomingEventsForViewer(ctx, viewerID, isAdmin, time.Time{})
+}
+
+func (s *Store) ListUpcomingEventsForViewer(ctx context.Context, viewerID int64, isAdmin bool, now time.Time) ([]EventView, error) {
+	if now.IsZero() {
+		return s.queryEvents(ctx, `ORDER BY e.date ASC`, nil, viewerID, isAdmin)
+	}
+	todayStr := localDateStr(now)
+	return s.queryEvents(ctx, `WHERE e.date >= ? ORDER BY e.date ASC`, []any{todayStr}, viewerID, isAdmin)
 }
 
 func (s *Store) queryEvents(ctx context.Context, clause string, args []any, viewerID int64, isAdmin bool) ([]EventView, error) {
@@ -1530,12 +1624,16 @@ func (s *Store) queryEvents(ctx context.Context, clause string, args []any, view
 			isLeadingBidder = true
 		}
 
-		if ev.Status == "resolved" || ev.Status == "done" {
+		if ev.Status == "skipped" {
+			ev.CanEditDetails = false
+			ev.CanVolunteer = false
+		} else if ev.Status == "resolved" || ev.Status == "done" {
 			ev.CanEditDetails = isWinner
+			ev.CanVolunteer = viewerID > 0 && !isWinner && ev.MyBidKind == ""
 		} else {
 			ev.CanEditDetails = isLeadingBidder
+			ev.CanVolunteer = viewerID > 0 && !isWinner && ev.MyBidKind == ""
 		}
-		ev.CanVolunteer = viewerID > 0 && !isWinner && ev.MyBidKind == ""
 
 		// Privacy rule: ONLY show bidder names on unresolved dates if help is requested
 		// (need_lead / need_follow / need_co) OR if the viewer is Admin.
@@ -1617,6 +1715,12 @@ func (s *Store) GenerateWeeklyDigest(ctx context.Context, now time.Time) (string
 			continue
 		}
 		switch ev.Status {
+		case "skipped":
+			note := ev.Notes
+			if note == "" {
+				note = "No dancing (Skipped)"
+			}
+			lines = append(lines, fmt.Sprintf("• *%s*: 🚫 *Skipped — %s*", ev.Date, note))
 		case "resolved", "done":
 			djLabel := ev.DJ
 			if djLabel == "" {

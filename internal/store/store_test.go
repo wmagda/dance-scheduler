@@ -146,6 +146,36 @@ func TestFairnessTokensPrivacyAndRecruitment(t *testing.T) {
 	if err != nil || sessTok == "" || loggedIn.ID != newbie.ID {
 		t.Fatalf("VerifyOTP: tok=%q err=%v", sessTok, err)
 	}
+
+	// 6. Skip/re-open date & hide past dates in ListUpcomingEventsForViewer
+	if err := st.SetEventSkipped(ctx, ev3.ID, true, "Thanksgiving", baseNow); err != nil {
+		t.Fatalf("SetEventSkipped(true): %v", err)
+	}
+	ev3Skipped, _ := st.GetEventView(ctx, ev3.ID, reg.ID, false)
+	if ev3Skipped.Status != "skipped" || ev3Skipped.Notes != "Thanksgiving" {
+		t.Fatalf("expected skipped event with note, got %+v", ev3Skipped)
+	}
+	availAfterSkip, _, _ := st.AvailableTokens(ctx, reg.ID, 2026)
+	if availAfterSkip != 2 {
+		t.Fatalf("expected Carlos's dibs token refunded on skipped date, got %d", availAfterSkip)
+	}
+	if err := st.PlaceBid(ctx, newbie.ID, ev3.ID, "normal", baseNow); err == nil {
+		t.Fatalf("expected PlaceBid on skipped date to fail")
+	}
+	if err := st.SetEventSkipped(ctx, ev3.ID, false, "", baseNow); err != nil {
+		t.Fatalf("SetEventSkipped(false): %v", err)
+	}
+	ev3Reopened, _ := st.GetEventView(ctx, ev3.ID, reg.ID, false)
+	if ev3Reopened.Status != "open" {
+		t.Fatalf("expected reopened event to be open, got %s", ev3Reopened.Status)
+	}
+
+	// Past events before today (e.g. when now is 2026-11-28, ev1=11-19 and ev2=11-26 are in the past)
+	futureNow := time.Date(2026, 11, 28, 18, 0, 0, 0, time.UTC)
+	upcoming, err := st.ListUpcomingEventsForViewer(ctx, newbie.ID, false, futureNow)
+	if err != nil || len(upcoming) == 0 || upcoming[0].Date != "2026-12-03" {
+		t.Fatalf("expected first upcoming date to be 2026-12-03, got %+v (err=%v)", upcoming[0], err)
+	}
 }
 
 func TestLegacySchemaMigrationAndEmailInviteExpiry(t *testing.T) {

@@ -156,6 +156,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/admin/tokens/grant", s.handleAdminGrantToken)
 	s.mux.HandleFunc("POST /api/admin/config", s.handleAdminUpdateConfig)
 	s.mux.HandleFunc("POST /api/admin/resolve", s.handleAdminResolve)
+	s.mux.HandleFunc("POST /api/admin/events/skip", s.handleAdminSkipEvent)
 	s.mux.HandleFunc("GET /api/admin/invite", s.handleAdminGetInvite)
 	s.mux.HandleFunc("POST /api/admin/invite/rotate", s.handleAdminRotateInvite)
 	s.mux.HandleFunc("POST /api/admin/invite/revoke", s.handleAdminRevokeInvite)
@@ -206,7 +207,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		isAdmin = viewer.IsAdmin
 	}
 
-	events, err := s.store.ListEventsForViewer(ctx, viewerID, isAdmin)
+	events, err := s.store.ListUpcomingEventsForViewer(ctx, viewerID, isAdmin, now)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -728,4 +729,24 @@ func (s *Server) handleAdminResolve(w http.ResponseWriter, r *http.Request) {
 		"recruited": recruited,
 		"escalated": escalated,
 	})
+}
+
+func (s *Server) handleAdminSkipEvent(w http.ResponseWriter, r *http.Request) {
+	if s.requireAdmin(w, r) == nil {
+		return
+	}
+	var req struct {
+		EventID int64  `json:"event_id"`
+		Skip    bool   `json:"skip"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if err := s.store.SetEventSkipped(r.Context(), req.EventID, req.Skip, req.Reason, time.Now().UTC()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

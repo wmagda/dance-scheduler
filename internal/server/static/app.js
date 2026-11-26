@@ -164,10 +164,12 @@ function renderEvents() {
   grid.innerHTML = list
     .map((ev) => {
       const isResolved = ev.status === "resolved" || ev.status === "done";
+      const isSkipped = ev.status === "skipped";
       let statusLabel = "Open to Teach";
       if (ev.status === "tentative") statusLabel = `Requested · Resolves ${ev.resolve_deadline}`;
       if (ev.status === "recruiting") statusLabel = `Recruiting · Needs Instructor!`;
       if (isResolved) statusLabel = `Confirmed: ${escapeHtml(ev.winner_name)}`;
+      if (isSkipped) statusLabel = ev.notes ? `Skipped: ${escapeHtml(ev.notes)}` : "Skipped (No Dancing)";
 
       const myBidBadge = ev.my_bid_kind
         ? `<span class="badge status-tentative">${ev.my_bid_kind === "token" ? "⭐ You Called Dibs" : "You Asked to Teach"}</span>`
@@ -209,7 +211,7 @@ function renderEvents() {
       }
 
       let bidActions = "";
-      if (STATE.viewer && !isResolved) {
+      if (STATE.viewer && !isResolved && !isSkipped) {
         if (!ev.my_bid_kind) {
           bidActions = `
             <button class="btn primary small" onclick="placeBid(${ev.id}, 'normal')">Ask to Teach</button>
@@ -228,13 +230,20 @@ function renderEvents() {
       }
 
       const editBtn =
-        STATE.viewer && ev.can_edit_details
+        STATE.viewer && ev.can_edit_details && !isSkipped
           ? `<button class="btn small" onclick="toggleEditDetails(${ev.id})">✏️ Night Details / Ask Help</button>`
           : "";
 
       const adminForceBtn =
-        STATE.viewer && STATE.viewer.is_admin && !isResolved
+        STATE.viewer && STATE.viewer.is_admin && !isResolved && !isSkipped
           ? `<button class="btn small" onclick="forceResolve(${ev.id})">⚡ Force Resolve</button>`
+          : "";
+
+      const adminSkipBtn =
+        STATE.viewer && STATE.viewer.is_admin
+          ? isSkipped
+            ? `<button class="btn small" onclick="toggleSkipDate(${ev.id}, false)">↩️ Re-Open Date</button>`
+            : `<button class="btn small" onclick="toggleSkipDate(${ev.id}, true)">🚫 Skip Date</button>`
           : "";
 
       let adminBidsHtml = "";
@@ -289,13 +298,16 @@ function renderEvents() {
         : "";
 
       const djDisplay = ev.dj ? escapeHtml(ev.dj) : "TBD";
+      const sublineHtml = isSkipped
+        ? `<div class="event-meta">${ev.notes ? `🚫 No Dancing — <strong>${escapeHtml(ev.notes)}</strong>` : "🚫 No Dancing (Holiday / Skipped)"}</div>`
+        : `<div class="event-meta">Lesson: <strong>${escapeHtml(ev.lesson_type.toUpperCase())}</strong>${ev.lesson_detail ? " (" + escapeHtml(ev.lesson_detail) + ")" : ""} · DJ: <strong>${djDisplay}</strong></div>`;
 
       return `
         <div class="event-card">
           <div class="event-head">
             <div>
               <div class="event-date">${formatDateNice(ev.date)}</div>
-              <div class="event-meta">Lesson: <strong>${escapeHtml(ev.lesson_type.toUpperCase())}</strong>${ev.lesson_detail ? " (" + escapeHtml(ev.lesson_detail) + ")" : ""} · DJ: <strong>${djDisplay}</strong></div>
+              ${sublineHtml}
             </div>
             <span class="badge status-${ev.status}">${statusLabel}</span>
           </div>
@@ -307,6 +319,7 @@ function renderEvents() {
             ${bidActions}
             ${editBtn}
             ${adminForceBtn}
+            ${adminSkipBtn}
           </div>
           ${drawerHtml}
         </div>
@@ -531,6 +544,22 @@ window.forceResolve = async (eventId) => {
   try {
     await api("/api/admin/resolve", { event_id: eventId });
     showToast("Date resolved!");
+    await loadState();
+  } catch (err) {
+    showToast(err.message);
+  }
+};
+
+window.toggleSkipDate = async (eventId, skip) => {
+  try {
+    let reason = "";
+    if (skip) {
+      const input = window.prompt("Optional reason for skipping this Thursday (e.g. Thanksgiving, Christmas):", "Holiday");
+      if (input === null) return;
+      reason = input.trim();
+    }
+    await api("/api/admin/events/skip", { event_id: eventId, skip, reason });
+    showToast(skip ? "Thursday marked as skipped." : "Thursday re-opened for teaching requests!");
     await loadState();
   } catch (err) {
     showToast(err.message);
